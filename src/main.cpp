@@ -6,6 +6,15 @@
 #include <cstring>
 #include <pthread.h>
 
+bool isDone;
+bool readingIsDone;
+
+#define PAIR_STACK_SIZE  4096
+#define SUM_PAIR_THREADS 3
+#define PAIR_AMOUNT      12
+#define STACK_PER_THREAD PAIR_AMOUNT / SUM_PAIR_THREADS
+#define STACK_SIZE       1024 * 1024 * 1024
+
 struct Pair
 {
   String key;
@@ -77,12 +86,6 @@ f64 parseNumber(Buffer* buffer)
 
   return sign * result;
 }
-bool isDone;
-
-#define PAIR_STACK_SIZE  4096
-#define SUM_PAIR_THREADS 5
-#define PAIR_AMOUNT      20
-#define STACK_PER_THREAD PAIR_AMOUNT / SUM_PAIR_THREADS
 
 struct SumPairArgs
 {
@@ -102,7 +105,6 @@ void* sumPairs(void* args_)
     {
       if (stack[i] != 0)
       {
-        printf("found one for %ld\n", (u64)map);
         Pair* s = stack[i]->pairs;
         for (u32 j = 0; j < stack[i]->ptr; j++)
         {
@@ -118,7 +120,6 @@ void* sumPairs(void* args_)
   {
     if (stack[i] != 0)
     {
-      printf("found one for %ld\n", (u64)map);
       Pair* s = stack[i]->pairs;
       for (u32 j = 0; j < stack[i]->ptr; j++)
       {
@@ -135,34 +136,31 @@ void* sumPairs(void* args_)
 
 struct ParsePairStackArgs
 {
-  PairStack** pairStack;
-  u64**       pairStackPointers;
+  Buffer** buffers;
 };
 
-void parsePairStack(PairStack* stack, Buffer* buffer)
+u64 parsePairStack(PairStack* stack, Buffer* buffer)
 {
   String key;
   Value  value;
   while (buffer->curr < buffer->len && stack->ptr < PAIR_STACK_SIZE)
   {
-    u64 start  = buffer->curr;
-    key.buffer = &buffer->buffer[start];
+    u64 start = buffer->curr;
     while (!isOutOfBounds(buffer) && getCurrentCharBuffer(buffer) != ';')
     {
       advanceBuffer(buffer);
     }
     if (isOutOfBounds(buffer))
     {
-      printf("returned after %d\n", stack->ptr);
-      return;
+      return buffer->len - start;
     }
-    key.len = buffer->curr - start;
+    key.buffer = &buffer->buffer[start];
+    key.len    = buffer->curr - start;
 
     advanceBuffer(buffer);
     if (isOutOfBounds(buffer))
     {
-      printf("returned after %d\n", stack->ptr);
-      return;
+      return buffer->len - start;
     }
 
     value.sum   = parseNumber(buffer);
@@ -174,23 +172,82 @@ void parsePairStack(PairStack* stack, Buffer* buffer)
     stack->pairs[stack->ptr] = (Pair){.key = key, .value = value};
     stack->ptr++;
   }
+  return 0;
+}
+
+#define NUMBER_OF_BUFFERS 4
+
+struct ReadPairsArgs
+{
+  PairStack** pairStack;
+  u64**       pairStackPointers;
+  Buffer**    buffers;
+};
+
+void* readPairs(void* args)
+{
+  Buffer*        buffer;
+  Buffer*        prevBuffer;
+  ReadPairsArgs* arg                = (ReadPairsArgs*)args;
+  PairStack**    pairStacks         = arg->pairStack;
+  u64**          pairStacksPointers = arg->pairStackPointers;
+  Buffer**       buffers            = arg->buffers;
+  u64            start              = 0;
+
+  while (!readingIsDone)
+  {
+    for (u32 i = 0; i < NUMBER_OF_BUFFERS; i++)
+    {
+      if (buffers[i] != 0)
+      {
+        buffer = buffers[i];
+        if (start != 0)
+        {
+          u64 newLen    = start + buffers[i]->len;
+          u8* newBuffer = (u8*)malloc(sizeof(u8) * (newLen));
+          memcpy(newBuffer, &prevBuffer->buffer[prevBuffer->len - start], start);
+          memcpy(&newBuffer[start], buffers[i]->buffer, buffers[i]->len);
+          buffer->len    = newLen;
+          buffer->buffer = newBuffer;
+        }
+
+        while (buffer->curr < buffer->len)
+        {
+          for (i32 i = 0; i < PAIR_AMOUNT; i++)
+          {
+            if (pairStacks[i] == 0)
+            {
+              pairStacks[i] = (PairStack*)pairStacksPointers[i];
+              start         = parsePairStack(pairStacks[i], buffer);
+              prevBuffer    = buffer;
+              break;
+            }
+          }
+        }
+
+        buffers[i] = 0;
+      }
+    }
+  }
+
+  isDone = true;
+
+  return 0;
 }
 
 void* parsePairs(void* args)
 {
-  Buffer              buffer;
-  ParsePairStackArgs* arg                = (ParsePairStackArgs*)args;
-  PairStack**         pairStacks         = arg->pairStack;
-  u64**               pairStacksPointers = arg->pairStackPointers;
+  ParsePairStackArgs* arg     = (ParsePairStackArgs*)args;
+  Buffer**            buffers = arg->buffers;
+  Buffer*             buffer;
   u8*                 memory;
   u64                 count;
   FILE*               filePtr;
   u64                 fileSize;
 
   u64                 totalBytesRead = 0;
-  u64                 stackSize      = ((u64)(100));
 
-  const char*         fileName       = "./measurements10000.txt";
+  const char*         fileName       = "./measurements1b.txt";
   filePtr                            = fopen(fileName, "rb");
   if (!filePtr)
   {
@@ -204,38 +261,40 @@ void* parsePairs(void* args)
 
   while (totalBytesRead < fileSize)
   {
-    memory = (u8*)malloc(sizeof(u8) * stackSize);
-    count  = fread(memory, 1, stackSize, filePtr);
+
+    memory = (u8*)malloc(sizeof(u8) * STACK_SIZE);
+    count  = fread(memory, 1, STACK_SIZE, filePtr);
     totalBytesRead += count;
 
-    buffer = (Buffer){.buffer = (u8*)memory, .curr = 0, .len = count};
+    buffer         = (Buffer*)malloc(sizeof(Buffer));
+    buffer->buffer = memory;
+    buffer->curr   = 0;
+    buffer->len    = count;
 
-    while (buffer.curr < buffer.len)
+    while (buffer != 0)
     {
-      for (i32 i = 0; i < PAIR_AMOUNT; i++)
+      for (u32 i = 0; i < NUMBER_OF_BUFFERS; i++)
       {
-        if (pairStacks[i] == 0)
+        if (buffers[i] == 0)
         {
-          pairStacks[i] = (PairStack*)pairStacksPointers[i];
-          parsePairStack(pairStacks[i], &buffer);
-          break;
+          buffers[i] = buffer;
+          buffer     = 0;
         }
       }
     }
-    if(totalBytesRead > 100){
-      break;
-    }
+    printf("Read %ld out of %ld, %lf\n", totalBytesRead, fileSize, totalBytesRead / (f64)fileSize);
   }
 
   printf("Read everything %ld\n", totalBytesRead);
-  isDone = true;
+  readingIsDone = true;
 
   return 0;
 }
 
 int main()
 {
-  isDone = false;
+  isDone        = false;
+  readingIsDone = false;
 
   initProfiler();
 
@@ -243,8 +302,6 @@ int main()
   Pair       pairs00[cap], pairs01[cap], pairs02[cap], pairs03[cap];
   Pair       pairs10[cap], pairs11[cap], pairs12[cap], pairs13[cap];
   Pair       pairs20[cap], pairs21[cap], pairs22[cap], pairs23[cap];
-  Pair       pairs30[cap], pairs31[cap], pairs32[cap], pairs33[cap];
-  Pair       pairs40[cap], pairs41[cap], pairs42[cap], pairs43[cap];
 
   PairStack  stack00 = (PairStack){.pairs = pairs00, .ptr = 0};
   PairStack  stack01 = (PairStack){.pairs = pairs01, .ptr = 0};
@@ -261,16 +318,6 @@ int main()
   PairStack  stack22 = (PairStack){.pairs = pairs22, .ptr = 0};
   PairStack  stack23 = (PairStack){.pairs = pairs23, .ptr = 0};
 
-  PairStack  stack30 = (PairStack){.pairs = pairs30, .ptr = 0};
-  PairStack  stack31 = (PairStack){.pairs = pairs31, .ptr = 0};
-  PairStack  stack32 = (PairStack){.pairs = pairs32, .ptr = 0};
-  PairStack  stack33 = (PairStack){.pairs = pairs33, .ptr = 0};
-
-  PairStack  stack40 = (PairStack){.pairs = pairs40, .ptr = 0};
-  PairStack  stack41 = (PairStack){.pairs = pairs41, .ptr = 0};
-  PairStack  stack42 = (PairStack){.pairs = pairs42, .ptr = 0};
-  PairStack  stack43 = (PairStack){.pairs = pairs43, .ptr = 0};
-
   PairStack* stack[PAIR_AMOUNT];
   for (i32 i = 0; i < PAIR_AMOUNT; i++)
   {
@@ -278,16 +325,21 @@ int main()
   }
 
   u64* stackPointers[PAIR_AMOUNT] = {
-      (u64*)&stack00, (u64*)&stack10, (u64*)&stack20, (u64*)&stack30, (u64*)&stack40, //
-      (u64*)&stack01, (u64*)&stack11, (u64*)&stack21, (u64*)&stack31, (u64*)&stack41, //
-      (u64*)&stack02, (u64*)&stack12, (u64*)&stack22, (u64*)&stack32, (u64*)&stack42, //
-      (u64*)&stack03, (u64*)&stack13, (u64*)&stack23, (u64*)&stack33, (u64*)&stack43, //
+      (u64*)&stack00, (u64*)&stack10, (u64*)&stack20, //
+      (u64*)&stack01, (u64*)&stack11, (u64*)&stack21, //
+      (u64*)&stack02, (u64*)&stack12, (u64*)&stack22, //
+      (u64*)&stack03, (u64*)&stack13, (u64*)&stack23, //
   };
-  ParsePairStackArgs args            = (ParsePairStackArgs){.pairStack = stack, .pairStackPointers = stackPointers};
+  Buffer*            buffers[NUMBER_OF_BUFFERS] = {0, 0, 0, 0};
 
-  u32                numberOfThreads = SUM_PAIR_THREADS + 1;
+  ParsePairStackArgs args                       = (ParsePairStackArgs){.buffers = buffers};
+
+  u32                numberOfThreads            = SUM_PAIR_THREADS + 2;
   pthread_t          threadIds[numberOfThreads];
   pthread_create(&threadIds[0], NULL, parsePairs, (void*)&args);
+
+  ReadPairsArgs readArgs = (ReadPairsArgs){.pairStack = stack, .pairStackPointers = stackPointers, .buffers = buffers};
+  pthread_create(&threadIds[1], NULL, readPairs, (void*)&readArgs);
 
   HashMap     maps[SUM_PAIR_THREADS];
   SumPairArgs sumPairArgs[SUM_PAIR_THREADS];
@@ -295,7 +347,7 @@ int main()
   {
     initHashMap(&maps[i], 1000);
     sumPairArgs[i] = (SumPairArgs){.map = &maps[i], .pairStack = &stack[i * (STACK_PER_THREAD)]};
-    pthread_create(&threadIds[i + 1], NULL, sumPairs, (void*)&sumPairArgs[i]);
+    pthread_create(&threadIds[i + 2], NULL, sumPairs, (void*)&sumPairArgs[i]);
   }
 
   for (u32 i = 0; i < numberOfThreads; i++)
@@ -306,23 +358,26 @@ int main()
     }
   }
 
-  HashMap map0 = maps[0];
-  for (u64 i = 0; i < map0.cap; i++)
   {
-    if (map0.values[i].count != 0)
+    TimeBlock("Last Gather");
+    HashMap map0 = maps[0];
+    for (u64 i = 0; i < map0.cap; i++)
     {
-      for (u64 j = 1; j < SUM_PAIR_THREADS; j++)
+      if (map0.values[i].count != 0)
       {
-        Value* val = lookupHashMap(&maps[j], map0.keys[i]);
-        if (val)
+        for (u64 j = 1; j < SUM_PAIR_THREADS; j++)
         {
-          map0.values[i].max = val->max > map0.values[i].max ? val->max : map0.values[i].max;
-          map0.values[i].min = val->min < map0.values[i].min ? val->min : map0.values[i].min;
-          map0.values[i].sum += val->sum;
-          map0.values[i].count += val->count;
+          Value* val = lookupHashMap(&maps[j], map0.keys[i]);
+          if (val)
+          {
+            map0.values[i].max = val->max > map0.values[i].max ? val->max : map0.values[i].max;
+            map0.values[i].min = val->min < map0.values[i].min ? val->min : map0.values[i].min;
+            map0.values[i].sum += val->sum;
+            map0.values[i].count += val->count;
+          }
         }
+        printf("%.*s=%.2lf/%.2lf/%.2lf\n", (i32)map0.keys[i].key.len, map0.keys[i].key.buffer, map0.values[i].min, map0.values[i].sum / (f64)map0.values[i].count, map0.values[i].max);
       }
-      printf("%.*s=%.2lf/%.2lf/%.2lf\n", (i32)map0.keys[i].key.len, map0.keys[i].key.buffer, map0.values[i].min, map0.values[i].sum / (f64)map0.values[i].count, map0.values[i].max);
     }
   }
 
