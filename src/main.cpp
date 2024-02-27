@@ -4,16 +4,16 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <pthread.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-bool isDone;
-bool readingIsDone;
+#define NUMBER_OF_THREADS 4
+#define PAIR_SIZE         4096
 
-#define PAIR_STACK_SIZE  4096
-#define SUM_PAIR_THREADS 3
-#define PAIR_AMOUNT      12
-#define STACK_PER_THREAD PAIR_AMOUNT / SUM_PAIR_THREADS
-#define STACK_SIZE       1024 * 1024 * 1024
+u8* fileContent;
 
 struct Pair
 {
@@ -24,7 +24,7 @@ struct Pair
 struct PairStack
 {
   Pair* pairs;
-  u32   ptr;
+  u64   count;
 };
 
 struct Buffer
@@ -87,81 +87,22 @@ f64 parseNumber(Buffer* buffer)
   return sign * result;
 }
 
-struct SumPairArgs
-{
-  HashMap*    map;
-  PairStack** pairStack;
-};
-
-void* sumPairs(void* args_)
-{
-  SumPairArgs* args  = (SumPairArgs*)args_;
-  PairStack**  stack = args->pairStack;
-  HashMap*     map   = args->map;
-
-  while (!isDone)
-  {
-    for (i32 i = 0; i < STACK_PER_THREAD; i++)
-    {
-      if (stack[i] != 0)
-      {
-        Pair* s = stack[i]->pairs;
-        for (u32 j = 0; j < stack[i]->ptr; j++)
-        {
-          updateHashMap(map, s[j].key, s[j].value);
-        }
-        stack[i]->ptr = 0;
-        stack[i]      = 0;
-      }
-    }
-  }
-
-  for (i32 i = 0; i < STACK_PER_THREAD; i++)
-  {
-    if (stack[i] != 0)
-    {
-      Pair* s = stack[i]->pairs;
-      for (u32 j = 0; j < stack[i]->ptr; j++)
-      {
-        updateHashMap(map, s[j].key, s[j].value);
-      }
-      stack[i]->ptr = 0;
-      stack[i]      = 0;
-    }
-  }
-  printf("Summed a thread\n");
-
-  return 0;
-}
-
-struct ParsePairStackArgs
-{
-  Buffer** buffers;
-};
-
-u64 parsePairStack(PairStack* stack, Buffer* buffer)
+void parsePairStack(PairStack* stack, Buffer* buffer)
 {
   String key;
   Value  value;
-  while (buffer->curr < buffer->len && stack->ptr < PAIR_STACK_SIZE)
+
+  while (stack->count < PAIR_SIZE && buffer->curr < buffer->len)
   {
     u64 start = buffer->curr;
-    while (!isOutOfBounds(buffer) && getCurrentCharBuffer(buffer) != ';')
+    while (getCurrentCharBuffer(buffer) != ';')
     {
       advanceBuffer(buffer);
-    }
-    if (isOutOfBounds(buffer))
-    {
-      return buffer->len - start;
     }
     key.buffer = &buffer->buffer[start];
     key.len    = buffer->curr - start;
 
     advanceBuffer(buffer);
-    if (isOutOfBounds(buffer))
-    {
-      return buffer->len - start;
-    }
 
     value.sum   = parseNumber(buffer);
     value.count = 1;
@@ -169,192 +110,213 @@ u64 parsePairStack(PairStack* stack, Buffer* buffer)
     value.min   = value.sum;
     advanceBuffer(buffer);
 
-    stack->pairs[stack->ptr] = (Pair){.key = key, .value = value};
-    stack->ptr++;
+    stack->pairs[stack->count].value = value;
+    stack->pairs[stack->count].key   = key;
+    stack->count++;
   }
-  return 0;
 }
 
-#define NUMBER_OF_BUFFERS 4
-
-struct ReadPairsArgs
+struct SumPairsArgs
 {
-  PairStack** pairStack;
-  u64**       pairStackPointers;
-  Buffer**    buffers;
+  PairStack** stack;
+  HashMap*    map;
+  bool*       done;
 };
 
-void* readPairs(void* args)
+void* sumPairs(void* args_)
 {
-  Buffer*        buffer;
-  Buffer*        prevBuffer;
-  ReadPairsArgs* arg                = (ReadPairsArgs*)args;
-  PairStack**    pairStacks         = arg->pairStack;
-  u64**          pairStacksPointers = arg->pairStackPointers;
-  Buffer**       buffers            = arg->buffers;
-  u64            start              = 0;
+  SumPairsArgs* args      = (SumPairsArgs*)args_;
+  PairStack**   pairStack = args->stack;
+  HashMap*      map       = args->map;
+  bool*         done      = args->done;
 
-  while (!readingIsDone)
+  while (!(*done))
   {
-    for (u32 i = 0; i < NUMBER_OF_BUFFERS; i++)
+    for (u32 i = 0; i < NUMBER_OF_THREADS; i++)
     {
-      if (buffers[i] != 0)
+      if (pairStack[i] != 0)
       {
-        buffer = buffers[i];
-        if (start != 0)
+        Pair* pairs = pairStack[i]->pairs;
+        u64   count = pairStack[i]->count;
+        for (u32 j = 0; j < count; j++)
         {
-          u64 newLen    = start + buffers[i]->len;
-          u8* newBuffer = (u8*)malloc(sizeof(u8) * (newLen));
-          memcpy(newBuffer, &prevBuffer->buffer[prevBuffer->len - start], start);
-          memcpy(&newBuffer[start], buffers[i]->buffer, buffers[i]->len);
-          buffer->len    = newLen;
-          buffer->buffer = newBuffer;
+          updateHashMap(map, pairs[j].key, pairs[j].value);
         }
-
-        while (buffer->curr < buffer->len)
-        {
-          for (i32 i = 0; i < PAIR_AMOUNT; i++)
-          {
-            if (pairStacks[i] == 0)
-            {
-              pairStacks[i] = (PairStack*)pairStacksPointers[i];
-              start         = parsePairStack(pairStacks[i], buffer);
-              prevBuffer    = buffer;
-              break;
-            }
-          }
-        }
-
-        buffers[i] = 0;
+        pairStack[i] = 0;
       }
     }
   }
-
-  isDone = true;
+  for (u32 i = 0; i < NUMBER_OF_THREADS; i++)
+  {
+    if (pairStack[i] != 0)
+    {
+      Pair* pairs = pairStack[i]->pairs;
+      for (u32 j = 0; j < PAIR_SIZE; j++)
+      {
+        updateHashMap(map, pairs[j].key, pairs[j].value);
+      }
+      pairStack[i] = 0;
+    }
+  }
 
   return 0;
 }
 
-void* parsePairs(void* args)
+struct ParsePairsArgs
 {
-  ParsePairStackArgs* arg     = (ParsePairStackArgs*)args;
-  Buffer**            buffers = arg->buffers;
-  Buffer*             buffer;
-  u8*                 memory;
-  u64                 count;
-  FILE*               filePtr;
-  u64                 fileSize;
+  PairStack** stack;
+  u64*        stackPointers;
+  Buffer      buffer;
+  bool        done;
+};
 
-  u64                 totalBytesRead = 0;
+void* parsePairs(void* args_)
+{
+  ParsePairsArgs* parsePairsArgs = (ParsePairsArgs*)args_;
+  PairStack**     pairStack      = parsePairsArgs->stack;
+  u64*            stackPointers  = parsePairsArgs->stackPointers;
+  Buffer          buffer         = parsePairsArgs->buffer;
 
-  const char*         fileName       = "./measurements1b.txt";
-  filePtr                            = fopen(fileName, "rb");
-  if (!filePtr)
+  while (getCurrentCharBuffer(&buffer) != '\n')
   {
-    printf("Failed to open file '%s'\n", fileName);
-    exit(1);
+    advanceBuffer(&buffer);
   }
+  advanceBuffer(&buffer);
 
-  fseek(filePtr, 0, SEEK_END);
-  fileSize = ftell(filePtr);
-  fseek(filePtr, 0, SEEK_SET);
-
-  while (totalBytesRead < fileSize)
+  while (buffer.curr < buffer.len)
   {
-
-    memory = (u8*)malloc(sizeof(u8) * STACK_SIZE);
-    count  = fread(memory, 1, STACK_SIZE, filePtr);
-    totalBytesRead += count;
-
-    buffer         = (Buffer*)malloc(sizeof(Buffer));
-    buffer->buffer = memory;
-    buffer->curr   = 0;
-    buffer->len    = count;
-
-    while (buffer != 0)
+    for (u32 i = 0; i < NUMBER_OF_THREADS; i++)
     {
-      for (u32 i = 0; i < NUMBER_OF_BUFFERS; i++)
+      if (pairStack[i] == 0)
       {
-        if (buffers[i] == 0)
-        {
-          buffers[i] = buffer;
-          buffer     = 0;
-        }
+        parsePairStack((PairStack*)stackPointers[i], &buffer);
+        pairStack[i] = (PairStack*)stackPointers[i];
       }
     }
-    printf("Read %ld out of %ld, %lf\n", totalBytesRead, fileSize, totalBytesRead / (f64)fileSize);
   }
-
-  printf("Read everything %ld\n", totalBytesRead);
-  readingIsDone = true;
-
   return 0;
 }
 
 int main()
 {
-  isDone        = false;
-  readingIsDone = false;
 
   initProfiler();
 
-  u32        cap = PAIR_STACK_SIZE;
-  Pair       pairs00[cap], pairs01[cap], pairs02[cap], pairs03[cap];
-  Pair       pairs10[cap], pairs11[cap], pairs12[cap], pairs13[cap];
-  Pair       pairs20[cap], pairs21[cap], pairs22[cap], pairs23[cap];
-
-  PairStack  stack00 = (PairStack){.pairs = pairs00, .ptr = 0};
-  PairStack  stack01 = (PairStack){.pairs = pairs01, .ptr = 0};
-  PairStack  stack02 = (PairStack){.pairs = pairs02, .ptr = 0};
-  PairStack  stack03 = (PairStack){.pairs = pairs03, .ptr = 0};
-
-  PairStack  stack10 = (PairStack){.pairs = pairs10, .ptr = 0};
-  PairStack  stack11 = (PairStack){.pairs = pairs11, .ptr = 0};
-  PairStack  stack12 = (PairStack){.pairs = pairs12, .ptr = 0};
-  PairStack  stack13 = (PairStack){.pairs = pairs13, .ptr = 0};
-
-  PairStack  stack20 = (PairStack){.pairs = pairs20, .ptr = 0};
-  PairStack  stack21 = (PairStack){.pairs = pairs21, .ptr = 0};
-  PairStack  stack22 = (PairStack){.pairs = pairs22, .ptr = 0};
-  PairStack  stack23 = (PairStack){.pairs = pairs23, .ptr = 0};
-
-  PairStack* stack[PAIR_AMOUNT];
-  for (i32 i = 0; i < PAIR_AMOUNT; i++)
+  const char* fileName = "./measurements10000.txt";
+  int         fd       = open(fileName, O_RDONLY);
+  if (fd == -1)
   {
-    stack[i] = 0;
+    printf("Failed to open file '%s'\n", fileName);
+    exit(1);
   }
 
-  u64* stackPointers[PAIR_AMOUNT] = {
-      (u64*)&stack00, (u64*)&stack10, (u64*)&stack20, //
-      (u64*)&stack01, (u64*)&stack11, (u64*)&stack21, //
-      (u64*)&stack02, (u64*)&stack12, (u64*)&stack22, //
-      (u64*)&stack03, (u64*)&stack13, (u64*)&stack23, //
+  struct stat fileStat;
+  if (fstat(fd, &fileStat) == -1)
+  {
+    printf("Failed to get file size");
+    exit(1);
+  }
+
+  size_t fileSize = fileStat.st_size;
+  fileContent     = (u8*)mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (fileContent == MAP_FAILED)
+  {
+    printf("error mapping file\n");
+    exit(1);
+  }
+
+  HashMap        maps[NUMBER_OF_THREADS];
+  pthread_t      threadIds[NUMBER_OF_THREADS * 2];
+
+  u64            batchSize = fileSize / NUMBER_OF_THREADS;
+
+  ParsePairsArgs args[NUMBER_OF_THREADS];
+  SumPairsArgs   sumArgs[NUMBER_OF_THREADS];
+
+  Pair           p00[PAIR_SIZE];
+  Pair           p01[PAIR_SIZE];
+  Pair           p02[PAIR_SIZE];
+  Pair           p03[PAIR_SIZE];
+
+  Pair           p10[PAIR_SIZE];
+  Pair           p11[PAIR_SIZE];
+  Pair           p12[PAIR_SIZE];
+  Pair           p13[PAIR_SIZE];
+
+  Pair           p20[PAIR_SIZE];
+  Pair           p21[PAIR_SIZE];
+  Pair           p22[PAIR_SIZE];
+  Pair           p23[PAIR_SIZE];
+
+  Pair           p30[PAIR_SIZE];
+  Pair           p31[PAIR_SIZE];
+  Pair           p32[PAIR_SIZE];
+  Pair           p33[PAIR_SIZE];
+
+  PairStack      stack0[4] = {
+      {p00, 0},
+      {p01, 0},
+      {p02, 0},
+      {p03, 0}
   };
-  Buffer*            buffers[NUMBER_OF_BUFFERS] = {0, 0, 0, 0};
+  PairStack stack1[4] = {
+      {p10, 0},
+      {p11, 0},
+      {p12, 0},
+      {p13, 0}
+  };
+  PairStack stack2[4] = {
+      {p20, 0},
+      {p21, 0},
+      {p22, 0},
+      {p23, 0}
+  };
+  PairStack stack3[4] = {
+      {p30, 0},
+      {p31, 0},
+      {p32, 0},
+      {p33, 0}
+  };
 
-  ParsePairStackArgs args                       = (ParsePairStackArgs){.buffers = buffers};
+  PairStack* pairStacks[NUMBER_OF_THREADS * NUMBER_OF_THREADS] = {
+      0, 0, 0, 0, //
+      0, 0, 0, 0, //
+      0, 0, 0, 0, //
+      0, 0, 0, 0  //
+  };
+  u64* pairStacksU64[NUMBER_OF_THREADS * NUMBER_OF_THREADS] = {
+      (u64*)&stack0[0], (u64*)&stack1[0], (u64*)&stack2[0], (u64*)&stack3[0], //
+      (u64*)&stack0[1], (u64*)&stack1[1], (u64*)&stack2[1], (u64*)&stack3[1], //
+      (u64*)&stack0[2], (u64*)&stack1[2], (u64*)&stack2[2], (u64*)&stack3[2], //
+      (u64*)&stack0[3], (u64*)&stack1[3], (u64*)&stack2[3], (u64*)&stack3[3], //
+  };
 
-  u32                numberOfThreads            = SUM_PAIR_THREADS + 2;
-  pthread_t          threadIds[numberOfThreads];
-  pthread_create(&threadIds[0], NULL, parsePairs, (void*)&args);
-
-  ReadPairsArgs readArgs = (ReadPairsArgs){.pairStack = stack, .pairStackPointers = stackPointers, .buffers = buffers};
-  pthread_create(&threadIds[1], NULL, readPairs, (void*)&readArgs);
-
-  HashMap     maps[SUM_PAIR_THREADS];
-  SumPairArgs sumPairArgs[SUM_PAIR_THREADS];
-  for (u32 i = 0; i < SUM_PAIR_THREADS; i++)
+  Buffer buffers[NUMBER_OF_THREADS];
   {
-    initHashMap(&maps[i], 1000);
-    sumPairArgs[i] = (SumPairArgs){.map = &maps[i], .pairStack = &stack[i * (STACK_PER_THREAD)]};
-    pthread_create(&threadIds[i + 2], NULL, sumPairs, (void*)&sumPairArgs[i]);
-  }
-
-  for (u32 i = 0; i < numberOfThreads; i++)
-  {
-    if (pthread_join(threadIds[i], NULL) != 0)
+    TimeBlock("Init parsing");
+    for (u32 i = 0; i < NUMBER_OF_THREADS; i++)
     {
-      printf("Failed something with thread?\n");
+      initHashMap(&maps[i], 100);
+
+      buffers[i] = (Buffer){
+          .buffer = &fileContent[i * batchSize],
+          .curr   = 0,
+          .len    = batchSize,
+      };
+
+      args[i] = (ParsePairsArgs){.stack = &pairStacks[i], .stackPointers = pairStacksU64[i], .buffer = buffers[i], .done = false};
+      pthread_create(&threadIds[i], NULL, parsePairs, (void*)&args[i]);
+
+      sumArgs[i] = (SumPairsArgs){.stack = &pairStacks[i], .map = &maps[i], .done = &args[i].done};
+      pthread_create(&threadIds[i + NUMBER_OF_THREADS], NULL, sumPairs, (void*)&sumArgs[i]);
+    }
+
+    for (u32 i = 0; i < NUMBER_OF_THREADS; i++)
+    {
+      if (pthread_join(threadIds[i], NULL) != 0)
+      {
+        printf("Failed something with thread?\n");
+      }
     }
   }
 
@@ -365,7 +327,7 @@ int main()
     {
       if (map0.values[i].count != 0)
       {
-        for (u64 j = 1; j < SUM_PAIR_THREADS; j++)
+        for (u64 j = 1; j < NUMBER_OF_THREADS; j++)
         {
           Value* val = lookupHashMap(&maps[j], map0.keys[i]);
           if (val)

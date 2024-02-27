@@ -110,10 +110,11 @@ void updateHashMap(HashMap* map, String key, Value value)
 
     if (map->keys[idx].hash == hash)
     {
-      map->values[idx].sum += value.sum;
-      map->values[idx].count++;
-      map->values[idx].max = value.sum > map->values[idx].max ? value.sum : map->values[idx].max;
-      map->values[idx].min = value.sum < map->values[idx].min ? value.sum : map->values[idx].min;
+      Value* val = &map->values[idx];
+      val->sum += value.sum;
+      val->count++;
+      val->max = value.sum > val->max ? value.sum : val->max;
+      val->min = value.sum < val->min ? value.sum : val->min;
       return;
     }
 
@@ -143,10 +144,12 @@ void updateHashMap(HashMap* map, String key, Value value)
   }
 }
 
-Value *lookupHashMap(struct HashMap *map, Key key) {
+Value* lookupHashMap(struct HashMap* map, Key key)
+{
   uint32_t idx = key.hash % map->cap;
 
-  if (map->keys[idx].hash == key.hash) {
+  if (map->keys[idx].hash == key.hash)
+  {
     return &map->values[idx];
   }
   uint32_t start = idx;
@@ -154,14 +157,17 @@ Value *lookupHashMap(struct HashMap *map, Key key) {
   idx++;
   idx %= map->cap;
 
-  while (idx != start) {
-    if (map->keys[idx].hash == key.hash) {
+  while (idx != start)
+  {
+    if (map->keys[idx].hash == key.hash)
+    {
       return &map->values[idx];
     }
     idx++;
     idx %= map->cap;
     // Isn't there
-    if (IS_EMPTY(map, idx)) {
+    if (IS_EMPTY(map, idx))
+    {
       return NULL;
     }
   }
