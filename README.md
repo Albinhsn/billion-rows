@@ -2,4 +2,4 @@
 Doing the one billion row challenge
 
 ## ToDo
-* Test better ways to parse the file
+* actually sort the printout
