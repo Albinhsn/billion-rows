@@ -12,21 +12,167 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#define IS_EMPTY(keys, i) (keys[i].hash == 0)
+
+#define TABLE_MAX_LOAD    0.50
+
+static inline void allocateMapArena(Arena* arena, HashMap* map, int len)
+{
+  size_t keySize = (sizeof(Key) * len);
+
+  u64    idx     = (u64)(arena->memory + (u64)(arena->top * arena->maxSize * 0.5f));
+  map->keys      = (Key*)(idx);
+  map->values    = (Value*)(idx + keySize);
+  arena->top     = !arena->top;
+}
+
+static void resizeHashMap(Arena* arena, HashMap* map)
+{
+  if (map->len / (float)map->cap >= TABLE_MAX_LOAD)
+  {
+    u32 prevCap = map->cap;
+    map->cap *= 2;
+    map->mask        = map->cap - 1;
+
+    Key*   oldKeys   = map->keys;
+    Value* oldValues = map->values;
+
+    allocateMapArena(arena, map, map->cap);
+
+    for (u32 i = 0; i < map->cap; i++)
+    {
+      map->keys[i] = (Key){
+          .key  = (String){.len = 0, .buffer = 0},
+          .hash = 0,
+      };
+      map->values[i] = (Value){
+          .count = 0,
+          .sum   = 0,
+          .max   = 0,
+          .min   = 0,
+      };
+    }
+
+    map->len = 0;
+
+    for (int i = 0; i < prevCap; i++)
+    {
+      if (oldKeys[i].hash != 0)
+      {
+        updateHashMap(arena, map, oldKeys[i], oldValues[i]);
+      }
+    }
+  }
+}
+
+void initHashMap(Arena* arena, HashMap* map, int len)
+{
+
+  allocateMapArena(arena, map, len);
+
+  for (int i = 0; i < len; i++)
+  {
+    map->keys[i].hash       = 0;
+    map->keys[i].key.buffer = 0;
+    map->values[i].sum      = 0;
+    map->values[i].count    = 0;
+    map->values[i].max      = -100;
+    map->values[i].min      = 100;
+  }
+  map->len  = 0;
+  map->mask = len - 1;
+  map->cap  = len;
+}
+
+static inline i32 min(i32 a, i32 b)
+{
+  return a ^ ((b ^ a) & -(b < a));
+}
+
+static inline i32 max(i32 a, i32 b)
+{
+  return a ^ ((b ^ a) & -(b > a));
+}
+
+struct IdxPair
+{
+  u32  idx;
+  bool inserted;
+};
+
+static inline IdxPair getIdx(Key* keys, Key key, u32 mask)
+{
+  u32 idx = key.hash & mask;
+  while (true)
+  {
+    if (keys[idx].hash == 0 || keys[idx].hash == key.hash)
+    {
+      IdxPair out = (IdxPair){.idx = idx, .inserted = keys[idx].hash == 0};
+      keys[idx]   = key;
+      return out;
+    }
+    idx = (idx + 1) & mask;
+  }
+}
+
+void updateHashMap(Arena* arena, HashMap* map, Key key, Value value)
+{
+  resizeHashMap(arena, map);
+
+  IdxPair idx = getIdx(map->keys, key, map->mask);
+  Value*  val = &map->values[idx.idx];
+  if (idx.inserted)
+  {
+    map->len++;
+    val->sum   = value.sum;
+    val->count = 1;
+    val->min   = value.min;
+    val->max   = value.max;
+  }
+  else
+  {
+    val->count += 1;
+    val->min = min(val->min, value.min);
+    val->max = max(val->max, value.max);
+    val->sum += value.sum;
+  }
+}
+
+Value* lookupHashMap(HashMap* map, Key key)
+{
+  u32  idx  = key.hash & map->cap;
+
+  Key* keys = map->keys;
+  if (keys[idx].hash == key.hash)
+  {
+    return &map->values[idx];
+  }
+  u32 start = idx;
+
+  idx++;
+  idx &= map->mask;
+
+  while (idx != start)
+  {
+    if (keys[idx].hash == key.hash)
+    {
+      return &map->values[idx];
+    }
+    idx++;
+    idx &= map->mask;
+    // Isn't there
+    if (IS_EMPTY(keys, idx))
+    {
+      return NULL;
+    }
+  }
+
+  return NULL;
+}
+
 #define NUMBER_OF_THREADS 15
 
 u8* fileContent;
-
-struct Pair
-{
-  String key;
-  Value  value;
-};
-
-struct PairStack
-{
-  Pair* pairs;
-  u64   count;
-};
 
 struct Buffer
 {
@@ -85,12 +231,37 @@ struct ParsePairsArgs
   Arena*   arena;
 };
 
+static inline void parseKey(Key* key, Buffer* buffer)
+{
+
+  u64 start = buffer->curr;
+  while (getCurrentCharBuffer(buffer) != ';')
+  {
+    key->hash ^= getCurrentCharBuffer(buffer);
+    key->hash *= 16777619;
+    advanceBuffer(buffer);
+  }
+
+  key->key.buffer = &buffer->buffer[start];
+  key->key.len    = buffer->curr - start;
+}
+static inline void parseSum(Value* value, Buffer* buffer)
+{
+
+  i32 v        = parseNumber(buffer);
+  value->sum   = v;
+  value->count = 1;
+  value->max   = v;
+  value->min   = v;
+}
+
 void* parsePairs(void* args_)
 {
   ParsePairsArgs* parsePairsArgs = (ParsePairsArgs*)args_;
   HashMap*        map            = parsePairsArgs->map;
   Buffer          buffer         = parsePairsArgs->buffer;
   Arena*          arena          = parsePairsArgs->arena;
+  TimeFunction;
 
   while (getCurrentCharBuffer(&buffer) != '\n')
   {
@@ -98,30 +269,19 @@ void* parsePairs(void* args_)
   }
   advanceBuffer(&buffer);
 
+  Value value;
   while (buffer.curr < buffer.len)
   {
-    Key   key = (Key){.hash = 2166136261u};
-    Value value;
-    u64   start = buffer.curr;
-    while (getCurrentCharBuffer(&buffer) != ';')
-    {
-      key.hash ^= getCurrentCharBuffer(&buffer);
-      key.hash *= 16777619;
-      advanceBuffer(&buffer);
-    }
+    Key key = (Key){.hash = 2166136261u};
 
-    key.key.buffer = &buffer.buffer[start];
-    key.key.len    = buffer.curr - start;
-
+    parseKey(&key, &buffer);
+    advanceBuffer(&buffer);
+    parseSum(&value, &buffer);
     advanceBuffer(&buffer);
 
-    value.sum   = parseNumber(&buffer);
-    value.count = 1;
-    value.max   = value.sum;
-    value.min   = value.sum;
-    advanceBuffer(&buffer);
     updateHashMap(arena, map, key, value);
   }
+
   printf("Parsed pairs\n");
   return 0;
 }
@@ -130,7 +290,7 @@ int main()
 {
 
   profiler.bestTime = FLT_MAX;
-  for (i32 k = 0; k < 5; k++)
+  for (i32 k = 0; k < 1; k++)
   {
 
     initProfiler();
@@ -154,11 +314,11 @@ int main()
       TimeBlock("Init parsing");
       for (u32 i = 0; i < NUMBER_OF_THREADS; i++)
       {
-        arenas[i].maxSize = 1024 * 1024 * 5;
-        arenas[i].memory  = (u64)malloc(sizeof(u8) * arenas[i].maxSize);
+        arenas[i].maxSize = 1024 * 1024 * 4;
+        arenas[i].memory  = (u64)mmap(NULL, arenas[i].maxSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         arenas[i].top     = false;
 
-        initHashMap(&arenas[i], &maps[i], 400);
+        initHashMap(&arenas[i], &maps[i], 4096);
         buffers[i] = (Buffer){
             .buffer = &fileContent[i * batchSize],
             .curr   = 0,
@@ -181,6 +341,7 @@ int main()
     {
       TimeBlock("Last Gather");
       HashMap map0 = maps[0];
+      // This is just broken btw
       // Can quite easily be done in parallel
       for (u64 i = 0; i < map0.cap; i++)
       {
@@ -197,18 +358,17 @@ int main()
               map0.values[i].count += val->count;
             }
           }
-          fprintf(stderr, "%.*s=%.2lf/%.2lf/%.2lf\n", (i32)map0.keys[i].key.len, map0.keys[i].key.buffer, map0.values[i].min / 10.0f, (map0.values[i].sum * 0.1f) / (f64)map0.values[i].count,
-                  map0.values[i].max / 10.0f);
+          printf("%.*s=%.2lf/%.2lf/%.2lf\n", (i32)map0.keys[i].key.len, map0.keys[i].key.buffer, map0.values[i].min / 10.0f, (map0.values[i].sum * 0.1f) / (f64)map0.values[i].count,
+                 map0.values[i].max / 10.0f);
         }
       }
     }
 
     displayProfilingResult();
+    printf("Best is %.4lfms\n", profiler.bestTime);
     for (u32 i = 0; i < NUMBER_OF_THREADS; i++)
     {
-      free((u8*)arenas[i].memory);
+      munmap((u8*)arenas[i].memory, arenas[i].maxSize);
     }
   }
-
-  printf("Best was %.4lfms\n", profiler.bestTime);
 }

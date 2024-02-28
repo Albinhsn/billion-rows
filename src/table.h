@@ -9,9 +9,9 @@
 struct Value
 {
   u64 count;
-  i64 sum;
-  i64 max;
-  i64 min;
+  i32 sum;
+  i32 max;
+  i32 min;
 };
 
 struct Key
@@ -25,6 +25,13 @@ struct HashMap
   u32    len;
   Key*   keys;
   Value* values;
+  u32    mask;
+};
+
+struct Pair
+{
+  Key   key;
+  Value value;
 };
 
 Value* lookupHashMap(struct HashMap* map, Key key);

@@ -4,3 +4,6 @@ obj/
 measurement*
 gmon.out
 profile.txt
+cachegrind*
+perf.data
+annotated.txt
