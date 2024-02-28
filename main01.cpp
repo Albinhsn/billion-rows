@@ -13,7 +13,7 @@
 #include <unistd.h>
 
 #define TABLE_MAX_LOAD    0.50
-#define NUMBER_OF_THREADS 15
+#define NUMBER_OF_THREADS 20
 #define MAP_HUGE2MB       (21 << MAP_HUGE_SHIFT)
 struct Buffer
 {
@@ -314,19 +314,20 @@ void* touchyTouchy(void* args)
   return 0;
 }
 
-int main(int argc, char** argv)
+int main()
 {
 
   profiler.bestTime = FLT_MAX;
   f64 minimum = FLT_MAX, maximum = -FLT_MAX;
-  u64 COUNT = 10;
+  u64 COUNT = 20;
   f64 SUM   = 0.0f;
   for (u64 k = 0; k < COUNT; k++)
   {
 
     initProfiler();
 
-    int         fd = open(argv[1], O_RDONLY);
+    const char* fileName = "./measurements1b.txt";
+    int         fd       = open(fileName, O_RDONLY);
     struct stat fileStat;
     fstat(fd, &fileStat);
 
@@ -397,11 +398,12 @@ int main(int argc, char** argv)
       printf("%.*s:%.2lf/%.2lf/%.2lf\n", (i32)key.key.len, key.key.buffer, val.min * 0.1f, val.sum / ((f64)val.count * 10.0f), val.max * 0.1f);
     }
 
+    displayProfilingResult();
+
     u64 endTime      = ReadCPUTimer();
     u64 totalElapsed = endTime - profiler.StartTSC;
     u64 cpuFreq      = EstimateCPUTimerFreq();
     f64 tot          = 1000.0 * (f64)totalElapsed / (f64)cpuFreq;
-    printf("Took %lf\n", tot);
     munmap((u8*)lastArena.memory, lastArena.maxSize);
     minimum = tot < minimum ? tot : minimum;
     maximum = tot > maximum ? tot : maximum;

@@ -1,5 +1,4 @@
 #include "common.h"
-#include <cfloat>
 #include <stdio.h>
 
 Profiler      profiler;
@@ -86,7 +85,7 @@ void initProfiler()
 {
   profiler.StartTSC         = ReadCPUTimer();
   globalProfilerParentIndex = 0;
-  for (i32 i = 0; i < ArrayCount(globalProfileAnchors); i++)
+  for (u64 i = 0; i < ArrayCount(globalProfileAnchors); i++)
   {
     globalProfileAnchors[i].label              = 0;
     globalProfileAnchors[i].hitCount           = 0;
