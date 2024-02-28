@@ -1,4 +1,5 @@
 #include "common.h"
+#include <cfloat>
 #include <stdio.h>
 
 Profiler      profiler;
@@ -83,7 +84,16 @@ u64 EstimateCPUTimerFreq(void)
 
 void initProfiler()
 {
-  profiler.StartTSC = ReadCPUTimer();
+  profiler.StartTSC         = ReadCPUTimer();
+  globalProfilerParentIndex = 0;
+  for (i32 i = 0; i < ArrayCount(globalProfileAnchors); i++)
+  {
+    globalProfileAnchors[i].label              = 0;
+    globalProfileAnchors[i].hitCount           = 0;
+    globalProfileAnchors[i].elapsedExclusive   = 0;
+    globalProfileAnchors[i].elapsedInclusive   = 0;
+    globalProfileAnchors[i].processedByteCount = 0;
+  }
 }
 
 void displayProfilingResult()
@@ -92,7 +102,9 @@ void displayProfilingResult()
   u64 totalElapsed = endTime - profiler.StartTSC;
   u64 cpuFreq      = EstimateCPUTimerFreq();
 
-  printf("\nTotal time: %0.4fms (CPU freq %lu)\n", 1000.0 * (f64)totalElapsed / (f64)cpuFreq, cpuFreq);
+  f64 tot = 1000.0 * (f64)totalElapsed / (f64)cpuFreq;
+  profiler.bestTime = tot < profiler.bestTime ? tot : profiler.bestTime; 
+  printf("\nTotal time: %0.4fms (CPU freq %lu)\n", tot, cpuFreq);
   for (u32 i = 0; i < ArrayCount(globalProfileAnchors); i++)
   {
     ProfileAnchor* profile = globalProfileAnchors + i;

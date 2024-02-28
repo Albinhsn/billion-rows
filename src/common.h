@@ -34,6 +34,7 @@ typedef struct Vec3f32;
 #endif
 
 struct Profiler {
+  f64 bestTime;
   u64 StartTSC;
   u64 EndTSC;
 };

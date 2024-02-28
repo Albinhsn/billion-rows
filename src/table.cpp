@@ -1,48 +1,47 @@
 #include "table.h"
+#include "arena.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 
-#define IS_EMPTY(map, i)     (map->keys[i].hash == 0 && map->values[i].sum == 0)
-#define IS_TOMBSTONE(map, i) (map->keys[i].hash != 0 && map->keys[i].key.buffer == 0)
+#define IS_EMPTY(map, i) (map->keys[i].hash == 0 && map->values[i].sum == 0)
 
-#define TABLE_MAX_LOAD       0.90
+#define TABLE_MAX_LOAD   0.50
 
-static u32 hashString(String key)
+static inline void allocateMapArena(Arena* arena, HashMap* map, int len)
 {
-  u32 hash = 2166136261u;
-  for (int i = 0; i < key.len; i++)
-  {
-    hash ^= key.buffer[i];
-    hash *= 16777619;
-  }
+  size_t keySize = (sizeof(Key) * len);
 
-  return hash;
+  u64    idx     = (u64)(arena->memory + (u64)(arena->top * arena->maxSize * 0.5f));
+  map->keys      = (Key*)(idx);
+  map->values    = (Value*)(idx + keySize);
+  arena->top     = !arena->top;
 }
 
-static void resizeHashMap(HashMap* map)
+static void resizeHashMap(Arena* arena, HashMap* map)
 {
   if (map->len / (float)map->cap >= TABLE_MAX_LOAD)
   {
     u32 prevCap = map->cap;
     map->cap *= 2;
 
-    Key* oldKeys     = map->keys;
-    map->keys        = (Key*)malloc(sizeof(Key) * map->cap);
-
+    Key*   oldKeys   = map->keys;
     Value* oldValues = map->values;
-    map->values      = (Value*)malloc(sizeof(Value) * map->cap);
 
-    for (int i = 0; i < map->cap; i++)
+    allocateMapArena(arena, map, map->cap);
+
+    for (u32 i = 0; i < map->cap; i++)
     {
-      map->keys[i].hash       = 0;
-      map->keys[i].key.buffer = 0;
-      map->keys[i].key.len    = 0;
-      map->keys[i].distance   = 0;
-      map->values[i].sum      = 0;
-      map->values[i].max      = 0;
-      map->values[i].min      = 0;
-      map->values[i].count    = 0;
+      map->keys[i] = (Key){
+          .key = (String){.len = 0, .buffer = 0},
+            .hash = 0
+      };
+      map->values[i] = (Value){
+          .count = 0,
+          .sum   = 0,
+          .max   = 0,
+          .min   = 0,
+      };
     }
 
     map->len = 0;
@@ -51,11 +50,9 @@ static void resizeHashMap(HashMap* map)
     {
       if (oldKeys[i].hash != 0)
       {
-        updateHashMap(map, oldKeys[i].key, oldValues[i]);
+        updateHashMap(arena, map, oldKeys[i], oldValues[i]);
       }
     }
-    free(oldKeys);
-    free(oldValues);
   }
 }
 
@@ -63,15 +60,16 @@ void debugHashMap(HashMap map)
 {
   for (int i = 0; i < map.cap; i++)
   {
-    printf("%d: (%.*s, %lf %ld %lf), %d\n", i, (i32)map.keys[i].key.len, map.keys[i].key.buffer, map.values[i].sum, map.values[i].count, map.values[i].max, map.keys[i].distance);
+    printf("%d: (%.*s, %d %ld %d)\n", i, (i32)map.keys[i].key.len, map.keys[i].key.buffer, map.values[i].sum, map.values[i].count, map.values[i].max);
   }
   printf("-\n");
 }
 
-void initHashMap(HashMap* map, int len)
+void initHashMap(Arena* arena, HashMap* map, int len)
 {
-  map->keys   = (Key*)malloc(sizeof(Key) * len);
-  map->values = (Value*)malloc(sizeof(Value) * len);
+
+  allocateMapArena(arena, map, len);
+
   for (int i = 0; i < len; i++)
   {
     map->keys[i].hash       = 0;
@@ -84,67 +82,49 @@ void initHashMap(HashMap* map, int len)
   map->cap = len;
 }
 
-static inline u32 probe_distance(u32 hash, u32 cap, u32 pos)
+static inline i32 min(i32 a, i32 b)
 {
-  u32 preferred = hash % cap;
-  return preferred <= pos ? pos - preferred : cap + pos - preferred;
+  return a ^ ((b ^ a) & -(b < a));
 }
 
-void updateHashMap(HashMap* map, String key, Value value)
+static inline i32 max(i32 a, i32 b)
 {
-  resizeHashMap(map);
-  u32 hash     = hashString(key);
-  u32 idx      = hash % map->cap;
+  return a ^ ((b ^ a) & -(b > a));
+}
 
-  u32 distance = 0;
+void updateHashMap(Arena* arena, HashMap* map, Key key, Value value)
+{
+  resizeHashMap(arena, map);
+  u32    idx    = key.hash % map->cap;
+
+  Key*   keys   = map->keys;
+  Value* values = map->values;
 
   while (true)
   {
     if (IS_EMPTY(map, idx))
     {
-      map->keys[idx]   = (Key){.key = key, .hash = hash, .distance = distance};
-      map->values[idx] = value;
+      keys[idx]   = (Key){.key = key.key, .hash = key.hash};
+      values[idx] = value;
       map->len++;
       return;
     }
 
-    if (map->keys[idx].hash == hash)
+    if (keys[idx].hash == key.hash)
     {
-      Value* val = &map->values[idx];
+      Value* val = &values[idx];
       val->sum += value.sum;
       val->count++;
-      val->max = value.sum > val->max ? value.sum : val->max;
-      val->min = value.sum < val->min ? value.sum : val->min;
+      val->max = max(value.sum, val->max);
+      val->min = min(value.sum, val->max);
       return;
     }
 
-    u32 prob_dis = probe_distance(map->keys[idx].hash, map->cap, idx);
-    if (distance > prob_dis)
-    {
-      if (IS_TOMBSTONE(map, idx))
-      {
-        map->keys[idx]   = (Key){.key = key, .hash = hash, .distance = distance};
-        map->values[idx] = value;
-        return;
-      }
-      Key   tmpKey     = map->keys[idx];
-      Value tmpValue   = map->values[idx];
-
-      map->keys[idx]   = (Key){.key = key, .hash = hash, .distance = distance};
-      map->values[idx] = value;
-
-      hash             = tmpKey.hash;
-      key              = tmpKey.key;
-      value            = tmpValue;
-
-      distance         = prob_dis;
-    }
     idx = (idx + 1) % map->cap;
-    ++distance;
   }
 }
 
-Value* lookupHashMap(struct HashMap* map, Key key)
+Value* lookupHashMap(HashMap* map, Key key)
 {
   uint32_t idx = key.hash % map->cap;
 
