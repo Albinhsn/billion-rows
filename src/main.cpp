@@ -1,399 +1,155 @@
-#include <cfloat>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <fcntl.h>
+#include <windows.h>
+#include <stdint.h>
 #include <sys/stat.h>
+#include <stdio.h>
+#include <psapi.h>
 
-#include "common.h"
-#include "platform.h"
-#include "arena.h"
-#include "arena.cpp"
-#include "common.cpp"
-#include "string.h"
-#include "table.h"
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
 
-#define TABLE_MAX_LOAD    0.50
-#define NUMBER_OF_THREADS 1
-#define MAP_HUGE2MB       (21 << MAP_HUGE_SHIFT)
-struct Buffer
+typedef int8_t s8;
+typedef int16_t s16;
+typedef int32_t s32;
+typedef int64_t s64;
+
+typedef float f32;
+typedef double f64;
+
+typedef bool b32;
+
+#define Kilobyte(B) (1024LL * B)
+#define Megabyte(B) (Kilobyte(B) * 1024LL)
+#define Gigabyte(B) (Megabyte(B) * 1024LL)
+
+#include "repetition.cpp"
+
+#define THREAD_ENTRYPOINT(Name) DWORD Name(void * RawInput)
+typedef THREAD_ENTRYPOINT(thread_entrypoint);
+
+inline void
+Deallocate(void * Memory)
 {
-  u8* buffer;
-  u64 curr;
-  u64 len;
+  VirtualFree(Memory, 0, MEM_RELEASE);
+}
+
+inline void *
+Allocate(u64 Size)
+{
+  return VirtualAlloc(0, Size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+}
+
+struct chunk
+{
+  u8 * Memory;
+  u8 * Next;
+  u64  Size;
+  b32  Done;
+  b32  Lock;
 };
 
-struct KeyIdx
+struct read_file_in_chunks_input
 {
-  Key key;
-  u64 idx;
+  chunk * Chunks;
+  char * Path;
+  u64 ChunkCount;
+  u64 ChunkSize;
 };
 
-struct IdxPair
+
+THREAD_ENTRYPOINT(ReadFileInChunks)
 {
-  u32  idx;
-  bool inserted;
+  read_file_in_chunks_input *Input = (read_file_in_chunks_input*)RawInput;
+
+  struct __stat64 Stat;
+  _stat64(Input->Path, &Stat);
+  HANDLE File = CreateFileA(Input->Path, GENERIC_READ, FILE_SHARE_READ, 0,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+
+  u64 BytesRemaining  = Stat.st_size;
+  u64 ChunkSize       = Input->ChunkSize;
+  u64 ChunkMask       = Input->ChunkCount - 1;
+  u8 * Chunks         = Input->Chunks;
+
+  u32 BytesRead   = 0;
+  u64 ChunkIndex  = 0;
+
+  while(BytesRemaining)
+  {
+    u8* Memory = Chunks + (ChunkIndex * ChunkSize);
+    ChunkIndex = (ChunkIndex + 1) & ChunkMask;
+    // ToDo Assert that the chunk is done
+
+    u64 ToRead = BytesRemaining < ChunkSize ? BytesRemaining : ChunkSize;
+
+    ReadFile(File, Memory, ToRead, (LPDWORD)&BytesRead, 0);
+    BytesRemaining -= ToRead;
+  }
+
+  CloseHandle(File);
+  return Result;
+}
+
+struct parse_chunks_input
+{
+  arena   Arena;
+  chunk * Chunks;
+  u32     ChunkCount;
 };
 
-struct ParsePairsArgs
+struct weather_entry
 {
-  Buffer   buffer;
-  HashMap* map;
-  Arena*   arena;
-  u32      threadId;
+  u64 Hash;
+  u32 Min;
+  u32 Max;
+  u32 Sum;
+  u32 Count;
 };
-u8*                fileContent;
 
-static inline bool isOutOfBounds(Buffer* buffer)
+struct parsed_chunk
 {
-  return buffer->curr >= buffer->len;
-}
+  weather_entry * Entries;
+  u64 EntryCount;
+};
 
-static inline u8 getCurrentCharBuffer(Buffer* buffer)
+struct parse_chunk_output
 {
-  return buffer->buffer[buffer->curr];
-}
+  weather_entry * Entries; // Sorted entries?
+  u64 EntryCount;
+};
 
-static inline void advanceBuffer(Buffer* buffer)
+THREAD_ENTRYPOINT(ParseChunks)
 {
-  buffer->curr++;
-}
+  u64 ChunkIndex = 0;
 
-inline i32 parseDigitFromChar(Buffer* buffer)
-{
-  return getCurrentCharBuffer(buffer) - (u8)'0';
-}
-
-static inline i32 Min(i32 a, i32 b)
-{
-  return a ^ ((b ^ a) & -(b < a));
-}
-
-static inline i32 Max(i32 a, i32 b)
-{
-  return a ^ ((b ^ a) & -(b > a));
-}
-
-static inline int cmp(const void* a_, const void* b_)
-{
-  String a   = ((KeyIdx*)a_)->key.key;
-  String b   = ((KeyIdx*)b_)->key.key;
-
-  int    res = strncmp((char*)a.buffer, (char*)b.buffer, Min(a.len, b.len));
-  return res != 0 ? res : a.len - b.len;
-}
-
-static inline void allocateMapArena(Arena* arena, HashMap* map, int len)
-{
-  size_t keySize = (sizeof(Key) * len);
-
-  u64    idx     = (u64)(arena->memory + (u64)(arena->top * arena->maxSize * 0.5f));
-  map->keys      = (Key*)(idx);
-  map->values    = (Value*)(idx + keySize);
-  arena->top     = !arena->top;
-}
-
-static void resizeHashMap(Arena* arena, HashMap* map)
-{
-  if (map->len / (float)map->cap >= TABLE_MAX_LOAD)
+  while(true)
   {
-    u32 prevCap = map->cap;
-    map->cap *= 2;
-    map->mask        = map->cap - 1;
+    // Check if we're done 
 
-    Key*   oldKeys   = map->keys;
-    Value* oldValues = map->values;
+    // Check if the one you're at is either locked or done 
+    //  Fastfowards if so
 
-    allocateMapArena(arena, map, map->cap);
+    // Check if you can acquire the one you're at
 
-    for (u32 i = 0; i < map->cap; i++)
-    {
-      map->keys[i] = (Key){
-          .key  = (String){.len = 0, .buffer = 0},
-          .hash = 0,
-      };
-      map->values[i] = (Value){
-          .count = 0,
-          .sum   = 0,
-          .max   = 0,
-          .min   = 0,
-      };
-    }
-
-    map->len = 0;
-
-    for (u32 i = 0; i < prevCap; i++)
-    {
-      if (oldKeys[i].hash != 0)
-      {
-        updateHashMap(arena, map, oldKeys[i], oldValues[i]);
-      }
-    }
   }
 }
 
-void initHashMap(Arena* arena, HashMap* map, int len)
+int
+main(int ArgCount, char** Args)
 {
-
-  allocateMapArena(arena, map, len);
-
-  for (int i = 0; i < len; i++)
+  if(ArgCount > 1)
   {
-    map->keys[i].hash       = 0;
-    map->keys[i].key.buffer = 0;
-    map->values[i].sum      = 0;
-    map->values[i].count    = 0;
-    map->values[i].max      = -100;
-    map->values[i].min      = 100;
-  }
-  map->len  = 0;
-  map->mask = len - 1;
-  map->cap  = len;
-}
 
-static inline IdxPair getIdx(Key* keys, Key key, u32 mask)
-{
-  u32 idx = key.hash & mask;
-  while (true)
-  {
-    if (keys[idx].hash == 0 || keys[idx].hash == key.hash)
-    {
-      IdxPair out = (IdxPair){.idx = idx, .inserted = keys[idx].hash == 0};
-      keys[idx]   = key;
-      return out;
-    }
-    idx = (idx + 1) & mask;
-  }
-}
+    read_file_in_chunks_input Input = {};
+    Input.Path = Args[1];
+    Input.ChunkSize = Megabyte(4);
+    u32 NumberOfChunks = 32;
+    Input.ChunkCount = NumberOfChunks;
+    Input.Chunks = (u8*)Allocate(Input.ChunkCount * Input.ChunkSize);
 
-void updateHashMap(Arena* arena, HashMap* map, Key key, Value value)
-{
-  resizeHashMap(arena, map);
+    ReadFileInChunks(&Input);
 
-  IdxPair idx = getIdx(map->keys, key, map->mask);
-  Value*  val = &map->values[idx.idx];
-  if (idx.inserted)
-  {
-    map->len++;
-    val->sum   = value.sum;
-    val->count = 1;
-    val->min   = value.min;
-    val->max   = value.max;
-  }
-  else
-  {
-    val->count += 1;
-    val->min = Min(val->min, value.min);
-    val->max = Max(val->max, value.max);
-    val->sum += value.sum;
-  }
-}
-
-Value* lookupHashMap(HashMap* map, Key key)
-{
-  u32  idx  = key.hash & map->cap;
-
-  Key* keys = map->keys;
-  if (keys[idx].hash == key.hash)
-  {
-    return &map->values[idx];
-  }
-  u32 start = idx;
-
-  idx++;
-  idx &= map->mask;
-
-  while (idx != start)
-  {
-    if (keys[idx].hash == key.hash)
-    {
-      return &map->values[idx];
-    }
-    idx++;
-    idx &= map->mask;
-    // Isn't there
-    if (keys[idx].hash == 0)
-    {
-      return NULL;
-    }
-  }
-
-  return NULL;
-}
-
-static inline i32 parseNumber(Buffer* buffer)
-{
-  i32 sign = getCurrentCharBuffer(buffer) == '-' ? -1 : 1;
-  if (sign == -1)
-  {
-    advanceBuffer(buffer);
-  }
-  i32 result = parseDigitFromChar(buffer);
-  advanceBuffer(buffer);
-
-  if (getCurrentCharBuffer(buffer) != '.')
-  {
-    result = result * 10 + parseDigitFromChar(buffer);
-    advanceBuffer(buffer);
-  }
-  advanceBuffer(buffer);
-
-  result = result * 10 + parseDigitFromChar(buffer);
-  advanceBuffer(buffer);
-
-  return sign * result;
-}
-
-static inline void parseKey(Key* key, Buffer* buffer)
-{
-
-  u64 start = buffer->curr;
-  while (getCurrentCharBuffer(buffer) != ';')
-  {
-    key->hash ^= getCurrentCharBuffer(buffer);
-    key->hash *= 16777619;
-    advanceBuffer(buffer);
-  }
-
-  key->key.buffer = &buffer->buffer[start];
-  key->key.len    = buffer->curr - start;
-}
-static inline void parseSum(Value* value, Buffer* buffer)
-{
-
-  i32 v        = parseNumber(buffer);
-  value->sum   = v;
-  value->count = 1;
-  value->max   = v;
-  value->min   = v;
-}
-
-PLATFORM_THREAD_FUNC(parsePairs)
-{
-  ParsePairsArgs* parsePairsArgs = (ParsePairsArgs*)Input;
-  HashMap*        map            = parsePairsArgs->map;
-  Buffer          buffer         = parsePairsArgs->buffer;
-  Arena*          arena          = parsePairsArgs->arena;
-  arena->maxSize                 = 1024 * 1024 * 4;
-  arena->memory                  = (u64)PlatformAllocate(arena->maxSize);
-  arena->top                     = false;
-
-  initHashMap(arena, map, 4096);
-
-  if (parsePairsArgs->threadId != 0)
-  {
-    while (getCurrentCharBuffer(&buffer) != '\n')
-    {
-      advanceBuffer(&buffer);
-    }
-    advanceBuffer(&buffer);
-  }
-
-  Value value;
-  while (buffer.curr < buffer.len)
-  {
-    Key key = (Key){.hash = 2166136261u};
-
-    parseKey(&key, &buffer);
-    advanceBuffer(&buffer);
-    parseSum(&value, &buffer);
-    advanceBuffer(&buffer);
-
-    updateHashMap(arena, map, key, value);
-  }
-
-  return 0;
-}
-
-PLATFORM_THREAD_FUNC(touchyTouchy)
-{
-  u32 fileSize = *(u32*)Input;
-  for (u32 i = 0; i < fileSize; i++)
-  {
-    u8 Cont = fileContent[i];
-  }
-  return 0;
-}
-
-int main(int argc, char** argv)
-{
-  if(argc > 1)
-  {
-    u64 StartTime = ReadCPUTimer();
-
-    u64 fileSize = 0;
-    fileContent = PlatformMapFile(argv[1], &fileSize);
-
-    Arena          lastArena;
-    Arena          arenas[NUMBER_OF_THREADS];
-    HashMap        lastMap;
-    HashMap        maps[NUMBER_OF_THREADS];
-    platform_thread threadIds[1 + NUMBER_OF_THREADS];
-    ParsePairsArgs args[NUMBER_OF_THREADS];
-    Buffer         buffers[NUMBER_OF_THREADS];
-
-    u64            batchSize = fileSize / NUMBER_OF_THREADS;
-
-    PlatformThreadCreate(&threadIds[NUMBER_OF_THREADS], touchyTouchy, (void*)&fileSize);
-
-    for (u32 i = 0; i < NUMBER_OF_THREADS; i++)
-    {
-      buffers[i] = (Buffer){
-          .buffer = &fileContent[i * batchSize],
-          .curr   = 0,
-          .len    = batchSize,
-      };
-
-      args[i] = (ParsePairsArgs){.buffer = buffers[i], .map = &maps[i], .arena = &arenas[i], .threadId = i};
-      PlatformThreadCreate(&threadIds[i], parsePairs, (void*)&args[i]);
-    }
-
-    lastArena.maxSize = 1024 * 1024 * 4;
-    lastArena.memory  = (u64)PlatformAllocate(lastArena.maxSize);
-    lastArena.top     = false;
-    initHashMap(&lastArena, &lastMap, 4096);
-
-    PlatformThreadJoin(&threadIds[NUMBER_OF_THREADS]);
-    for (u32 i = 0; i < NUMBER_OF_THREADS; i++)
-    {
-      PlatformThreadJoin(&threadIds[i]);
-      Key*   keys   = maps[i].keys;
-      Value* values = maps[i].values;
-      for (u64 j = 0; j < maps[i].cap; j++)
-      {
-        if (values[j].count != 0)
-        {
-          updateHashMap(&lastArena, &lastMap, keys[j], values[j]);
-        }
-      }
-    }
-
-    KeyIdx *keys = (KeyIdx*)PlatformAllocate(lastMap.len * sizeof(KeyIdx));
-    u64    count = 0;
-    for (u64 i = 0; i < lastMap.cap; i++)
-    {
-      if (lastMap.values[i].count != 0)
-      {
-        keys[count] = (KeyIdx){.key = lastMap.keys[i], .idx = i};
-        count++;
-      }
-    }
-
-    qsort(keys, lastMap.len, sizeof(KeyIdx), cmp);
-
-    for (u64 i = 0; i < lastMap.len; i++)
-    {
-      Key   key = keys[i].key;
-      Value val = lastMap.values[keys[i].idx];
-      printf("%.*s:%.2lf/%.2lf/%.2lf %lld\n", (i32)key.key.len, key.key.buffer,
-             val.min * 0.1f, val.sum / ((f64)val.count * 10.0f), val.max * 0.1f, val.count);
-    }
-
-    u64 endTime      = ReadCPUTimer();
-    u64 totalElapsed = endTime - StartTime;
-    u64 cpuFreq      = EstimateCPUTimerFreq();
-    f64 tot          = (f64)totalElapsed / (f64)cpuFreq;
-    printf("Took %.2lfs\n", tot);
   }
   else
   {

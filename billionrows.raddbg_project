@@ -1,6 +1,8 @@
 // raddbg 0.9.19 project file
 
 recent_file: path: "src/main.cpp"
+recent_file: path: "D:/a/_work/1/s/src/vctools/crt/vcstartup/src/startup/exe_common.inl"
+recent_file: path: "D:/os/obj/amd64fre/minkernel/crts/ucrt/src/appcrt/misc/mt/objfre/amd64/minkernel/crts/ucrt/src/appcrt/misc/invalid_parameter.cpp"
 recent_file: path: "src/platform.h"
 recent_file: path: "../Rendering/src/win32_helpers.cpp"
 recent_file: path: "../Rendering/src/main.cpp"
@@ -49,13 +51,8 @@ recent_file: path: "../Rendering/build/projection.exe"
 recent_file: path: "../Rendering/src/projection.cpp"
 target:
 {
-  executable: "main.exe"
+  executable: "build/main.exe"
   working_directory: ""
   enabled: 1
-  arguments: "measurements10k.txt"
-}
-breakpoint:
-{
-  source_location: "src/main.cpp:322:1"
-  hit_count: 1
+  arguments: "measurements1b.txt"
 }

@@ -1,2 +1,2 @@
 
-clang++ -O0 -g main.cpp -o ..\main.exe 
+clang++ -O2 -g main.cpp -o ..\build\main.exe 
