@@ -1,4 +1,3 @@
-#include "common.h"
 #include <stdio.h>
 
 Profiler      profiler;
@@ -9,7 +8,7 @@ static void   PrintTimeElapsed(ProfileAnchor* Anchor, u64 timerFreq, u64 TotalTS
 {
 
   f64 Percent = 100.0 * ((f64)Anchor->elapsedExclusive / (f64)TotalTSCElapsed);
-  printf("  %s[%lu]: %lu (%.2f%%", Anchor->label, Anchor->hitCount, Anchor->elapsedExclusive, Percent);
+  printf("  %s[%llu]: %llu (%.2f%%", Anchor->label, Anchor->hitCount, Anchor->elapsedExclusive, Percent);
   if (Anchor->elapsedInclusive != Anchor->elapsedExclusive)
   {
     f64 PercentWithChildren = 100.0 * ((f64)Anchor->elapsedInclusive / (f64)TotalTSCElapsed);
@@ -38,22 +37,23 @@ static u64 ReadOSTimer(void)
 {
   // NOTE(casey): The "struct" keyword is not necessary here when compiling in C++,
   // but just in case anyone is using this file from C, I include it.
+  #if PLATFORM_LINUX
   struct timeval Value;
   gettimeofday(&Value, 0);
 
   u64 Result = GetOSTimerFreq() * (u64)Value.tv_sec + (u64)Value.tv_usec;
+#else
+	LARGE_INTEGER Value;
+	QueryPerformanceCounter(&Value);
+	u64 Result = Value.QuadPart;
+
+  #endif
+
   return Result;
 }
 
-/* NOTE(casey): This does not need to be "inline", it could just be "static"
-   because compilers will inline it anyway. But compilers will warn about
-   static functions that aren't used. So "inline" is just the simplest way
-   to tell them to stop complaining about that. */
 u64 ReadCPUTimer(void)
 {
-  // NOTE(casey): If you were on ARM, you would need to replace __rdtsc
-  // with one of their performance counter read instructions, depending
-  // on which ones are available on your platform.
 
   return __rdtsc();
 }
@@ -103,7 +103,7 @@ void displayProfilingResult()
 
   f64 tot = 1000.0 * (f64)totalElapsed / (f64)cpuFreq;
   profiler.bestTime = tot < profiler.bestTime ? tot : profiler.bestTime; 
-  printf("\nTotal time: %0.4fms (CPU freq %lu)\n", tot, cpuFreq);
+  printf("\nTotal time: %0.4fms (CPU freq %llu)\n", tot, cpuFreq);
   for (u32 i = 0; i < ArrayCount(globalProfileAnchors); i++)
   {
     ProfileAnchor* profile = globalProfileAnchors + i;

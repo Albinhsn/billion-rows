@@ -1,19 +1,20 @@
-#include "arena.h"
-#include "common.h"
-#include "string.h"
-#include "table.h"
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
-#include <pthread.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
-#include <unistd.h>
+
+#include "common.h"
+#include "platform.h"
+#include "arena.h"
+#include "arena.cpp"
+#include "common.cpp"
+#include "string.h"
+#include "table.h"
 
 #define TABLE_MAX_LOAD    0.50
-#define NUMBER_OF_THREADS 15
+#define NUMBER_OF_THREADS 1
 #define MAP_HUGE2MB       (21 << MAP_HUGE_SHIFT)
 struct Buffer
 {
@@ -63,12 +64,12 @@ inline i32 parseDigitFromChar(Buffer* buffer)
   return getCurrentCharBuffer(buffer) - (u8)'0';
 }
 
-static inline i32 min(i32 a, i32 b)
+static inline i32 Min(i32 a, i32 b)
 {
   return a ^ ((b ^ a) & -(b < a));
 }
 
-static inline i32 max(i32 a, i32 b)
+static inline i32 Max(i32 a, i32 b)
 {
   return a ^ ((b ^ a) & -(b > a));
 }
@@ -78,7 +79,7 @@ static inline int cmp(const void* a_, const void* b_)
   String a   = ((KeyIdx*)a_)->key.key;
   String b   = ((KeyIdx*)b_)->key.key;
 
-  int    res = strncmp((char*)a.buffer, (char*)b.buffer, min(a.len, b.len));
+  int    res = strncmp((char*)a.buffer, (char*)b.buffer, Min(a.len, b.len));
   return res != 0 ? res : a.len - b.len;
 }
 
@@ -182,8 +183,8 @@ void updateHashMap(Arena* arena, HashMap* map, Key key, Value value)
   else
   {
     val->count += 1;
-    val->min = min(val->min, value.min);
-    val->max = max(val->max, value.max);
+    val->min = Min(val->min, value.min);
+    val->max = Max(val->max, value.max);
     val->sum += value.sum;
   }
 }
@@ -267,14 +268,14 @@ static inline void parseSum(Value* value, Buffer* buffer)
   value->min   = v;
 }
 
-void* parsePairs(void* args_)
+PLATFORM_THREAD_FUNC(parsePairs)
 {
-  ParsePairsArgs* parsePairsArgs = (ParsePairsArgs*)args_;
+  ParsePairsArgs* parsePairsArgs = (ParsePairsArgs*)Input;
   HashMap*        map            = parsePairsArgs->map;
   Buffer          buffer         = parsePairsArgs->buffer;
   Arena*          arena          = parsePairsArgs->arena;
   arena->maxSize                 = 1024 * 1024 * 4;
-  arena->memory                  = (u64)mmap(NULL, arena->maxSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE2MB, -1, 0);
+  arena->memory                  = (u64)PlatformAllocate(arena->maxSize);
   arena->top                     = false;
 
   initHashMap(arena, map, 4096);
@@ -304,46 +305,36 @@ void* parsePairs(void* args_)
   return 0;
 }
 
-void* touchyTouchy(void* args)
+PLATFORM_THREAD_FUNC(touchyTouchy)
 {
-  u64 fileSize = *(u64*)args;
+  u32 fileSize = *(u32*)Input;
   for (u32 i = 0; i < fileSize; i++)
   {
-    fileContent[i] = fileContent[i];
+    u8 Cont = fileContent[i];
   }
   return 0;
 }
 
 int main(int argc, char** argv)
 {
-
-  profiler.bestTime = FLT_MAX;
-  f64 minimum = FLT_MAX, maximum = -FLT_MAX;
-  u64 COUNT = 10;
-  f64 SUM   = 0.0f;
-  for (u64 k = 0; k < COUNT; k++)
+  if(argc > 1)
   {
+    u64 StartTime = ReadCPUTimer();
 
-    initProfiler();
-
-    int         fd = open(argv[1], O_RDONLY);
-    struct stat fileStat;
-    fstat(fd, &fileStat);
-
-    size_t fileSize = fileStat.st_size;
-    fileContent     = (u8*)mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+    u64 fileSize = 0;
+    fileContent = PlatformMapFile(argv[1], &fileSize);
 
     Arena          lastArena;
     Arena          arenas[NUMBER_OF_THREADS];
     HashMap        lastMap;
     HashMap        maps[NUMBER_OF_THREADS];
-    pthread_t      threadIds[1 + NUMBER_OF_THREADS];
+    platform_thread threadIds[1 + NUMBER_OF_THREADS];
     ParsePairsArgs args[NUMBER_OF_THREADS];
     Buffer         buffers[NUMBER_OF_THREADS];
 
     u64            batchSize = fileSize / NUMBER_OF_THREADS;
 
-    pthread_create(&threadIds[NUMBER_OF_THREADS], NULL, touchyTouchy, (void*)&fileSize);
+    PlatformThreadCreate(&threadIds[NUMBER_OF_THREADS], touchyTouchy, (void*)&fileSize);
 
     for (u32 i = 0; i < NUMBER_OF_THREADS; i++)
     {
@@ -354,18 +345,18 @@ int main(int argc, char** argv)
       };
 
       args[i] = (ParsePairsArgs){.buffer = buffers[i], .map = &maps[i], .arena = &arenas[i], .threadId = i};
-      pthread_create(&threadIds[i], NULL, parsePairs, (void*)&args[i]);
+      PlatformThreadCreate(&threadIds[i], parsePairs, (void*)&args[i]);
     }
 
     lastArena.maxSize = 1024 * 1024 * 4;
-    lastArena.memory  = (u64)mmap(NULL, lastArena.maxSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE2MB, -1, 0);
+    lastArena.memory  = (u64)PlatformAllocate(lastArena.maxSize);
     lastArena.top     = false;
     initHashMap(&lastArena, &lastMap, 4096);
 
-    pthread_join(threadIds[NUMBER_OF_THREADS], NULL);
+    PlatformThreadJoin(&threadIds[NUMBER_OF_THREADS]);
     for (u32 i = 0; i < NUMBER_OF_THREADS; i++)
     {
-      pthread_join(threadIds[i], NULL);
+      PlatformThreadJoin(&threadIds[i]);
       Key*   keys   = maps[i].keys;
       Value* values = maps[i].values;
       for (u64 j = 0; j < maps[i].cap; j++)
@@ -377,7 +368,7 @@ int main(int argc, char** argv)
       }
     }
 
-    KeyIdx keys[lastMap.len];
+    KeyIdx *keys = (KeyIdx*)PlatformAllocate(lastMap.len * sizeof(KeyIdx));
     u64    count = 0;
     for (u64 i = 0; i < lastMap.cap; i++)
     {
@@ -394,27 +385,19 @@ int main(int argc, char** argv)
     {
       Key   key = keys[i].key;
       Value val = lastMap.values[keys[i].idx];
-      printf("%.*s:%.2lf/%.2lf/%.2lf\n", (i32)key.key.len, key.key.buffer, val.min * 0.1f, val.sum / ((f64)val.count * 10.0f), val.max * 0.1f);
+      printf("%.*s:%.2lf/%.2lf/%.2lf %lld\n", (i32)key.key.len, key.key.buffer,
+             val.min * 0.1f, val.sum / ((f64)val.count * 10.0f), val.max * 0.1f, val.count);
     }
 
     u64 endTime      = ReadCPUTimer();
-    u64 totalElapsed = endTime - profiler.StartTSC;
+    u64 totalElapsed = endTime - StartTime;
     u64 cpuFreq      = EstimateCPUTimerFreq();
-    f64 tot          = 1000.0 * (f64)totalElapsed / (f64)cpuFreq;
-    printf("Took %lf\n", tot);
-    munmap((u8*)lastArena.memory, lastArena.maxSize);
-    minimum = tot < minimum ? tot : minimum;
-    maximum = tot > maximum ? tot : maximum;
-    SUM += tot;
-
-    for (u32 i = 0; i < NUMBER_OF_THREADS; i++)
-    {
-      munmap((u8*)arenas[i].memory, arenas[i].maxSize);
-    }
-
-    close(fd);
+    f64 tot          = (f64)totalElapsed / (f64)cpuFreq;
+    printf("Took %.2lfs\n", tot);
   }
-  printf("MIN: %lf\n", minimum);
-  printf("MAX: %lf\n", maximum);
-  printf("MEAN: %lf\n", SUM / (f64)COUNT);
+  else
+  {
+    OutputDebugStringA("No file given!\n");
+  }
+
 }

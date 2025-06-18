@@ -1,5 +1,5 @@
 CC := g++
-CFLAGS := -flto -march=native -mtune=native -pthread -O2 -Wall -Wno-missing-braces
+CFLAGS := -march=native -mtune=native -pthread -O2 -Wall -Wno-missing-braces
 TARGET := main 
 
 SRCS = $(wildcard src/*.cpp)

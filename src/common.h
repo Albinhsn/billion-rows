@@ -8,8 +8,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <sys/time.h>
-#include <x86intrin.h>
 
 #include <time.h>
 typedef uint8_t u8;
@@ -25,7 +23,6 @@ typedef int16_t i16;
 typedef int i32;
 typedef int64_t i64;
 
-typedef struct Vec3f32;
 
 #define PROFILER 1
 
@@ -111,8 +108,6 @@ struct ProfileBlock {
 #define TimeFunction
 #endif
 
-#define MIN(x, y) (x < y ? x : y)
-#define MAX(x, y) (x < y ? y : x)
 #define PI 3.14159265358979323846 /* pi */
 
 #define DEGREES_TO_RADIANS(d) (d * PI / 100.0)
@@ -121,14 +116,5 @@ struct ProfileBlock {
 
 #define LINEAR_TO_GAMMA(x) sqrt(x)
 
-#define RED ((struct Vec3f32){1.0f, 0, 0})
-#define YELLOW ((struct Vec3f32){1.0f, 1.0f, 0})
-#define GREEN ((struct Vec3f32){0, 1.0f, 0})
-#define CYAN ((struct Vec3f32){0, 1.0f, 1.0f})
-#define PURPLE ((struct Vec3f32){1.0f, 0, 1.0f})
-#define BLUE ((struct Vec3f32){0.0f, 0, 1.0f})
-#define WHITE ((struct Vec3f32){1.0f, 1.0f, 1.0f})
-#define BLACK ((struct Vec3f32){0, 0, 0})
-#define SOMEBLUE ((struct Vec3f32){0.5f, 0.7f, 1.0f})
 
 #endif

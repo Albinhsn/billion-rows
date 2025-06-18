@@ -7,3 +7,7 @@ profile.txt
 cachegrind*
 perf.data
 annotated.txt
+main.exe
+main.ilk
+main.pdb
+main.rdi
