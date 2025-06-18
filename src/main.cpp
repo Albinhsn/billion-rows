@@ -23,10 +23,21 @@ typedef bool b32;
 #define Megabyte(B) (Kilobyte(B) * 1024LL)
 #define Gigabyte(B) (Megabyte(B) * 1024LL)
 
+#define Assert(Expr)\
+  if(!(Expr))\
+    *(int*)0 = 5;
+
 #include "repetition.cpp"
 
 #define THREAD_ENTRYPOINT(Name) DWORD Name(void * RawInput)
 typedef THREAD_ENTRYPOINT(thread_entrypoint);
+
+struct arena
+{
+  u8 * Memory;
+  u64  Size;
+  u64  Offset;
+};
 
 inline void
 Deallocate(void * Memory)
@@ -40,13 +51,22 @@ Allocate(u64 Size)
   return VirtualAlloc(0, Size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }
 
+#define AllocateStruct(Size, Type) (Type*)Allocate(Size * sizeof(Type))
+
+struct flag_table
+{
+  b32 FinishedReading;
+  volatile u32 ParseIndex;
+};
+volatile flag_table * GlobalFlagTable;
+
 struct chunk
 {
   u8 * Memory;
   u8 * Next;
   u64  Size;
-  b32  Done;
   b32  Lock;
+  b32  Done;
 };
 
 struct read_file_in_chunks_input
@@ -70,25 +90,31 @@ THREAD_ENTRYPOINT(ReadFileInChunks)
   u64 BytesRemaining  = Stat.st_size;
   u64 ChunkSize       = Input->ChunkSize;
   u64 ChunkMask       = Input->ChunkCount - 1;
-  u8 * Chunks         = Input->Chunks;
+  chunk * Chunks         = Input->Chunks;
 
   u32 BytesRead   = 0;
   u64 ChunkIndex  = 0;
 
+  b32 FirstLap = false;
+
   while(BytesRemaining)
   {
-    u8* Memory = Chunks + (ChunkIndex * ChunkSize);
+    chunk* Chunk = Chunks + (ChunkIndex * ChunkSize);
     ChunkIndex = (ChunkIndex + 1) & ChunkMask;
-    // ToDo Assert that the chunk is done
+    FirstLap |= ChunkIndex == 0 ? true : false;
+    Assert(!(Chunk->Done ^ FirstLap));
 
     u64 ToRead = BytesRemaining < ChunkSize ? BytesRemaining : ChunkSize;
 
-    ReadFile(File, Memory, ToRead, (LPDWORD)&BytesRead, 0);
+    Chunk->Size = ToRead;
+    ReadFile(File, Chunk->Memory, ToRead, (LPDWORD)&BytesRead, 0);
     BytesRemaining -= ToRead;
   }
 
+  GlobalFlagTable->FinishedReading = true;
+
   CloseHandle(File);
-  return Result;
+  return 0;
 }
 
 struct parse_chunks_input
@@ -126,6 +152,10 @@ THREAD_ENTRYPOINT(ParseChunks)
   while(true)
   {
     // Check if we're done 
+    if(GlobalFlagTable->FinishedParsing)
+    {
+
+    }
 
     // Check if the one you're at is either locked or done 
     //  Fastfowards if so
@@ -141,12 +171,21 @@ main(int ArgCount, char** Args)
   if(ArgCount > 1)
   {
 
+    flag_table Table = {};
+    GlobalFlagTable = &Table;
+
     read_file_in_chunks_input Input = {};
     Input.Path = Args[1];
     Input.ChunkSize = Megabyte(4);
     u32 NumberOfChunks = 32;
     Input.ChunkCount = NumberOfChunks;
-    Input.Chunks = (u8*)Allocate(Input.ChunkCount * Input.ChunkSize);
+    Input.Chunks = AllocateStruct(Input.ChunkCount, chunk);
+    for(u32 ChunkIndex = 0;
+        ChunkIndex < NumberOfChunks;
+        ChunkIndex++)
+    {
+      Input.Chunks[ChunkIndex].Memory = AllocateStruct(NumberOfChunks, u8);
+    }
 
     ReadFileInChunks(&Input);
 
