@@ -22,6 +22,7 @@ typedef bool b32;
 #define Kilobyte(B) (1024LL * B)
 #define Megabyte(B) (Kilobyte(B) * 1024LL)
 #define Gigabyte(B) (Megabyte(B) * 1024LL)
+#define ArrayCount(Array) (sizeof(Array) / sizeof(Array[0]))
 
 #define Assert(Expr)\
   if(!(Expr))\
@@ -38,27 +39,6 @@ struct arena
   u64  Size;
   u64  Offset;
 };
-
-inline void
-Deallocate(void * Memory)
-{
-  VirtualFree(Memory, 0, MEM_RELEASE);
-}
-
-inline void *
-Allocate(u64 Size)
-{
-  return VirtualAlloc(0, Size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-}
-
-#define AllocateStruct(Size, Type) (Type*)Allocate(Size * sizeof(Type))
-
-struct flag_table
-{
-  b32 FinishedReading;
-  u32 TotalChunkCount;
-};
-volatile flag_table * GlobalFlagTable;
 
 struct chunk
 {
@@ -77,6 +57,253 @@ struct read_file_in_chunks_input
   u64 ChunkCount;
   u64 ChunkSize;
 };
+
+struct flag_table
+{
+  volatile b32 FinishedReading;
+  volatile b32 FinishedSorting;
+  u32 TotalChunkCount;
+};
+
+struct weather_entry
+{
+  volatile b32 Written;
+  u64 Key;
+  s64 Sum;
+  s32 Min;
+  s32 Max;
+  u32 Count;
+};
+
+struct parse_chunks_input
+{
+  weather_entry * Table; // Always 1024 * 16 sized
+  chunk * Chunks;
+  u32     ChunkCount;
+};
+
+
+struct chunk_buffer
+{
+  u8 * Memory;
+  u8 * End;
+  u8 ** Next;
+  b32 ReachedEndOfBuffer;
+};
+struct string_entry
+{
+  u64 Key;
+  u8* Name;
+};
+
+
+struct parse_string_hashes_input
+{
+  arena Arena;
+  chunk * Chunks;
+  u32 ChunkCount;
+};
+
+#define MAX_THREAD_COUNT 3
+
+string_entry * GlobalStringTable; // Array of 10k
+u32 GlobalStringCount = 0;
+volatile flag_table * GlobalFlagTable;
+weather_entry* GlobalEntryList[MAX_THREAD_COUNT - 2]; // 
+
+inline void
+Deallocate(void * Memory)
+{
+  VirtualFree(Memory, 0, MEM_RELEASE);
+}
+
+inline void *
+Allocate(u64 Size)
+{
+  return VirtualAlloc(0, Size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+}
+#define AllocateStruct(Size, Type) (Type*)Allocate(Size * sizeof(Type))
+
+inline void 
+AdvanceBuffer(chunk_buffer * Buffer)
+{
+  Assert(Buffer->Memory < Buffer->End);
+  Buffer->Memory++;
+  if(Buffer->Memory == Buffer->End)
+  {
+    Assert(!Buffer->ReachedEndOfBuffer);
+
+    Buffer->Memory = *Buffer->Next;
+    Buffer->ReachedEndOfBuffer = true;
+  }
+}
+
+inline u64
+Hash(u32 a)
+{
+  u64 h = a;
+  h ^= h >> 33;
+  h *= 0xff51afd7ed558ccdL;
+  h ^= h >> 33;
+  h *= 0xc4ceb9fe1a85ec53L;
+  h ^= h >> 33;
+  return h;
+}
+
+inline s32
+Min(s32 a, s32 b)
+{
+  return a ^ ((b ^ a) & -(b < a));
+}
+
+inline s32
+Max(s32 a, s32 b)
+{
+  return a ^ ((b ^ a) & -(b > a));
+}
+
+inline weather_entry * 
+LookupEntry(weather_entry * Table, u64 Key)
+{
+  u32 Mask = (1024 * 16) - 1;
+  u32 Index = Key & Mask;
+
+  u32 Start = Index;
+  while(true)
+  {
+    weather_entry * Entry = Table + Index;
+    if(Entry->Key == Key)
+    {
+      return Entry;
+    }
+    if(Entry->Key == 0)
+    {
+      return 0;
+    }
+    Index = (Index + 1) & Mask;
+    if(Index == Start)
+    {
+      return 0;
+    }
+  }
+}
+
+inline weather_entry * 
+LookupOrAddEntry(weather_entry * Table, u64 Key)
+{
+  u32 Mask = (1024 * 16) - 1;
+  u32 Index = Key & Mask;
+
+  while(true)
+  {
+    weather_entry * Entry = Table + Index;
+    if(Entry->Key == Key)
+    {
+      return Entry;
+    }
+    if(Entry->Key == 0)
+    {
+      Entry->Key = Key;
+      Entry->Min = INT_MAX;
+      Entry->Max = -INT_MAX;
+      return Entry;
+    }
+    Index = (Index + 1) & Mask;
+  }
+}
+
+inline u32
+AtomicCompareExchange(volatile u32* Dest, u32 Exchange, u32 Compare)
+{
+  u32 Result = InterlockedCompareExchange(Dest, Exchange, Compare);
+  return Result;
+}
+
+inline b32
+StringAlreadyExists(u64 Key)
+{
+  b32 Result = false;
+  for(u32 Index = 0;
+      Index < GlobalStringCount;
+      Index++)
+  {
+    string_entry * Entry = GlobalStringTable + Index;
+    if(Entry->Key == Key)
+    {
+      Result = true;
+      break;
+    }
+  }
+
+  return Result;
+}
+
+s32 StringCompare(const void * A_, const void * B_)
+{
+  string_entry * A = (string_entry*)A_;
+  string_entry * B = (string_entry*)B_;
+
+  return strcmp((const char*)A->Name, (const char*)B->Name);
+};
+
+
+
+void
+PrintSortedEntryLists(u8 * Memory, u32 Size)
+{
+  while(!GlobalFlagTable->FinishedSorting)
+  {
+    // Some intrinsic here for waiting?
+  }
+
+  u32 BufferIndices[MAX_THREAD_COUNT - 2] = {};
+
+  u32 Offset = 0;
+  u8 * Start = Memory;
+  for(u32 StringIndex = 0;
+      StringIndex < GlobalStringCount;
+      StringIndex++)
+  {
+    string_entry * StringEntry = GlobalStringTable + StringIndex;
+    weather_entry FinalWeatherEntry = {};
+    FinalWeatherEntry.Min = INT_MAX;
+    FinalWeatherEntry.Max = -INT_MAX;
+    for(u32 BufferIndex = 0;
+        BufferIndex < ArrayCount(BufferIndices);
+        BufferIndex++)
+    {
+      weather_entry * Buffer = GlobalEntryList[BufferIndex];
+      u32 CurrentIndex       = BufferIndices[BufferIndex];
+
+      weather_entry * Entry = Buffer + CurrentIndex;
+      while(!Entry->Written)
+      {
+        // Intrinsic?
+      }
+
+      if(Entry->Key == StringEntry->Key)
+      {
+        FinalWeatherEntry.Count += Entry->Count;
+        FinalWeatherEntry.Min = Min(FinalWeatherEntry.Min, Entry->Min);
+        FinalWeatherEntry.Max = Max(FinalWeatherEntry.Max, Entry->Max);
+        FinalWeatherEntry.Sum += Entry->Sum;
+        BufferIndices[BufferIndex]++;
+      }
+    }
+
+    f32 Mean    = FinalWeatherEntry.Sum / (10.0f * (f32)FinalWeatherEntry.Count);
+    f32 Minimum = FinalWeatherEntry.Min / 10.0f;
+    f32 Maximum = FinalWeatherEntry.Max / 10.0f;
+
+    u32 Written = sprintf((char*)Memory, "%s=%.1f/%.1f/%.1f, ", StringEntry->Name, Minimum,
+                      Mean, Maximum);
+    Offset += Written;
+    Memory += Written;
+  }
+
+  printf("{%.*s}\n", Offset, Start);
+
+}
 
 
 THREAD_ENTRYPOINT(ReadFileInChunks)
@@ -122,102 +349,36 @@ THREAD_ENTRYPOINT(ReadFileInChunks)
   GlobalFlagTable->FinishedReading = true;
 
   CloseHandle(File);
+
+
   return 0;
 }
 
-struct weather_entry
+
+
+void 
+ProduceSortedEntryList(weather_entry * EntryTable)
 {
-  u64 Key;
-  s64 Sum;
-  s32 Min;
-  s32 Max;
-  u32 Count;
-};
-
-struct parse_chunks_input
-{
-  weather_entry * Table; // Always 1024 * 16 sized
-  chunk * Chunks;
-  u32     ChunkCount;
-};
-
-
-struct chunk_buffer
-{
-  u8 * Memory;
-  u8 * End;
-  u8 ** Next;
-  b32 ReachedEndOfBuffer;
-};
-
-
-inline void 
-AdvanceBuffer(chunk_buffer * Buffer)
-{
-  Assert(Buffer->Memory < Buffer->End);
-  Buffer->Memory++;
-  if(Buffer->Memory == Buffer->End)
+  while(!GlobalFlagTable->FinishedSorting)
   {
-    Assert(!Buffer->ReachedEndOfBuffer);
-
-    Buffer->Memory = *Buffer->Next;
-    Buffer->ReachedEndOfBuffer = true;
+    // Some intrinsic here for waiting?
   }
-}
 
-inline u64
-Hash(u32 a)
-{
-  u64 h = a;
-  h ^= h >> 33;
-  h *= 0xff51afd7ed558ccdL;
-  h ^= h >> 33;
-  h *= 0xc4ceb9fe1a85ec53L;
-  h ^= h >> 33;
-  return h;
-}
-
-inline s32
-Min(s32 a, s32 b)
-{
-  return a ^ ((b ^ a) & -(b < a));
-}
-
-inline s32
-Max(s32 a, s32 b)
-{
-  return a ^ ((b ^ a) & -(b > a));
-}
-
-inline weather_entry * 
-LookupOrAddEntry(weather_entry * Table, u64 Key)
-{
-  u32 Mask = (1024 * 16) - 1;
-  u32 Index = Key & Mask;
-
-  while(true)
+  weather_entry * Buffer = GlobalEntryList[0];
+  for(u32 StringIndex = 0;
+      StringIndex < GlobalStringCount;
+      StringIndex++)
   {
-    weather_entry * Entry = Table + Index;
-    if(Entry->Key == Key)
+    string_entry * StringEntry = GlobalStringTable + StringIndex;
+    
+    weather_entry * WeatherEntry = LookupEntry(EntryTable, StringEntry->Key);
+    if(WeatherEntry)
     {
-      return Entry;
+      *Buffer = *WeatherEntry;
+      Buffer->Written = true;
+      Buffer++;
     }
-    if(Entry->Key == 0)
-    {
-      Entry->Key = Key;
-      Entry->Min = INT_MAX;
-      Entry->Max = -INT_MAX;
-      return Entry;
-    }
-    Index = (Index + 1) & Mask;
   }
-}
-
-inline u32
-AtomicCompareExchange(volatile u32* Dest, u32 Exchange, u32 Compare)
-{
-  u32 Result = InterlockedCompareExchange(Dest, Exchange, Compare);
-  return Result;
 }
 
 
@@ -311,42 +472,8 @@ THREAD_ENTRYPOINT(ParseChunks)
     }
   }
 
+
   return 0;
-}
-
-struct string_entry
-{
-  u64 Key;
-  u8* Name;
-};
-
-string_entry * GlobalStringTable; // Array of 10k
-u32 StringCount = 0;
-
-struct parse_string_hashes_input
-{
-  arena Arena;
-  chunk * Chunks;
-  u32 ChunkCount;
-};
-
-inline b32
-StringAlreadyExists(u64 Key)
-{
-  b32 Result = false;
-  for(u32 Index = 0;
-      Index < StringCount;
-      Index++)
-  {
-    string_entry * Entry = GlobalStringTable + Index;
-    if(Entry->Key == Key)
-    {
-      Result = true;
-      break;
-    }
-  }
-
-  return Result;
 }
 
 THREAD_ENTRYPOINT(ParseStringHashes)
@@ -397,7 +524,7 @@ THREAD_ENTRYPOINT(ParseStringHashes)
         Arena.Offset = Offset + 1;
         Assert(Arena.Offset < Arena.Size);
 
-        string_entry * Entry = GlobalStringTable + StringCount++;
+        string_entry * Entry = GlobalStringTable + GlobalStringCount++;
         Entry->Key  = Key;
         Entry->Name = Start;
       }
@@ -428,6 +555,9 @@ THREAD_ENTRYPOINT(ParseStringHashes)
     }
   }
 
+  qsort(GlobalStringTable, GlobalStringCount, sizeof(string_entry), StringCompare);
+  GlobalFlagTable->FinishedSorting = true;
+
   return 0;
 }
 
@@ -436,18 +566,26 @@ main(int ArgCount, char** Args)
 {
   if(ArgCount > 1)
   {
+    u64 CPUFreq = EstimateCPUTimerFreq();
 
+    u64 Start = ReadCPUTimer();
     flag_table Table = {};
     GlobalFlagTable = &Table;
 
     GlobalStringTable = AllocateStruct(10000, string_entry);
+    for(u32 Index = 0;
+        Index < ArrayCount(GlobalEntryList);
+        Index++)
+    {
+      GlobalEntryList[Index] = AllocateStruct(10000, weather_entry);
+    }
 
     u32 ChunkCount = 1;
     chunk * Chunks = AllocateStruct(ChunkCount, chunk);
 
     read_file_in_chunks_input Input = {};
     Input.Path        = Args[1];
-    Input.ChunkSize   = Gigabyte(15);
+    Input.ChunkSize   = Gigabyte(18);
     Input.ChunkCount  = ChunkCount;
     Input.Chunks      = Chunks;
     for(u32 ChunkIndex = 0;
@@ -471,6 +609,21 @@ main(int ArgCount, char** Args)
     HashInput.Chunks = Chunks;
     HashInput.ChunkCount = ChunkCount;
     ParseStringHashes(&HashInput);
+
+    ProduceSortedEntryList(ParseInput.Table);
+
+    u32 PrintMemorySize = Megabyte(1);
+    u8 * PrintMemory    = (u8*)Allocate(PrintMemorySize);
+    PrintSortedEntryLists(PrintMemory, PrintMemorySize);
+
+    struct __stat64 Stat;
+    _stat64(Args[1], &Stat);
+    u64 End = ReadCPUTimer();
+    u64 TotalElapsed = End - Start;
+    u64 Size = Stat.st_size;
+    f64 TotalSeconds = (TotalElapsed / (f64)CPUFreq);
+    printf("Total time: %0.4fms\n", 1000.0 * (f64)TotalElapsed / (f64)CPUFreq);
+    printf("Filesize: %llu after %.2fs, mb/s:%.2f\n", Size, TotalSeconds, Size / (TotalSeconds * Megabyte(1)));
 
 
   }
