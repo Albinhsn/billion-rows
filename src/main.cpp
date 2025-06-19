@@ -1,6 +1,6 @@
 
-#if 0
-#define TRACY_ENABLE 0
+#if 1
+#define TRACY_ENABLE 1
 #include "tracy/public/tracy/Tracy.hpp"
 #include "tracy/public/TracyClient.cpp"
 #else
@@ -10,6 +10,7 @@
 #endif
 
 #include <windows.h>
+#include <intrin.h>
 #include <stdint.h>
 #include <sys/stat.h>
 #include <stdio.h>
@@ -84,11 +85,9 @@ struct flag_table
 
 struct weather_entry
 {
+  u8* Name;
   u64 Key;
-  char * Name;
-  volatile b32 Written;
-  volatile b32 Done;
-
+  b32 New;
   s64 Sum;
   s32 Min;
   s32 Max;
@@ -98,6 +97,8 @@ struct weather_entry
 struct parse_chunks_input
 {
   weather_entry * Table; // Always 1024 * 16 sized
+  weather_entry * Entries; // Always 10k
+  u8 * StringMemory;
   u8 * FileMemory;
   u64 MemorySize;
   u32 ThreadIndex;
@@ -111,9 +112,10 @@ struct chunk_buffer
   u64 Size;
   b32 ReachedEndOfBuffer;
 };
+
 struct string_entry
 {
-  u64 Key;
+  volatile u64 Key;
   u8* Name;
 };
 
@@ -129,6 +131,8 @@ struct parse_string_hashes_input
 #define MAX_THREAD_COUNT 16
 
 volatile flag_table * GlobalFlagTable;
+volatile u32 TotalStringEntries = 0;
+volatile string_entry * GlobalStringTable;
 weather_entry * GlobalEntryList[MAX_THREAD_COUNT];
 
 inline void
@@ -142,7 +146,7 @@ Allocate(u64 Size)
 {
   return VirtualAlloc(0, Size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }
-#define AllocateStruct(Size, Type) (Type*)Allocate(Size * sizeof(Type))
+#define AllocateStruct(Size, Type) (Type*)Allocate((Size) * sizeof(Type))
 
 inline u8 
 Current(chunk_buffer * Buffer)
@@ -154,9 +158,8 @@ inline void
 AdvanceBuffer(chunk_buffer * Buffer, b32 InName)
 {
   Buffer->Offset++;
-  if(Buffer->Offset == Buffer->Size)
+  if(Buffer->Offset >= Buffer->Size)
   {
-    Assert(!Buffer->ReachedEndOfBuffer);
     Buffer->ReachedEndOfBuffer = true;
   }
 }
@@ -201,7 +204,7 @@ LookupEntry(weather_entry * Table, u64 Key)
 }
 
 inline weather_entry * 
-LookupOrAddEntry(weather_entry * Table, u64 Key)
+LookupOrAddEntry(weather_entry * Table, u64 Key, u8 * Name)
 {
   u32 Mask = (1024 * 16) - 1;
   u32 Index = Key & Mask;
@@ -211,13 +214,16 @@ LookupOrAddEntry(weather_entry * Table, u64 Key)
     weather_entry * Entry = Table + Index;
     if(Entry->Key == Key)
     {
+      Entry->New = false;
       return Entry;
     }
     if(Entry->Key == 0)
     {
       Entry->Key = Key;
+      Entry->Name = Name;
       Entry->Min = INT_MAX;
       Entry->Max = -INT_MAX;
+      Entry->New = true;
       return Entry;
     }
     Index = (Index + 1) & Mask;
@@ -229,6 +235,47 @@ AtomicCompareExchange(volatile u32* Dest, u32 Exchange, u32 Compare)
 {
   u32 Result = InterlockedCompareExchange(Dest, Exchange, Compare);
   return Result;
+}
+
+inline void
+AtomicIncrementU32(volatile u32* Dest)
+{
+  InterlockedIncrement(Dest);
+}
+
+inline u64
+AtomicCompareExchange64(volatile u64* Dest, u64 Exchange, u64 Compare)
+{
+  u64 Result = InterlockedCompareExchange64((volatile s64*)Dest, Exchange, Compare);
+  return Result;
+}
+
+inline void
+AddToGlobalStringTable(u64 Key, u8* Name)
+{
+  u32 Mask = (1024 * 16) - 1;
+  u32 Index = Key & Mask;
+  while(true)
+  {
+    volatile string_entry * Entry = GlobalStringTable + Index;
+    if(Entry->Key == Key)
+    {
+      return;
+    }
+    if(Entry->Key == 0)
+    {
+      u64 PrevKey = AtomicCompareExchange64(&Entry->Key, Key, 0);
+      if(!PrevKey)
+      {
+        AtomicIncrementU32(&TotalStringEntries);
+        Entry->Key = Key;
+        Entry->Name = Name;
+      }
+      return;
+    }
+    Index = (Index + 1) & Mask;
+  }
+
 }
 
 inline b32
@@ -254,6 +301,15 @@ StringAlreadyExists(string_entry * Table, u64 Key)
 }
 
 inline s32
+WeatherCompare(const void * A_, const void * B_)
+{
+  weather_entry * A = (weather_entry*)A_;
+  weather_entry * B = (weather_entry*)B_;
+
+  return strcmp((const char*)A->Name, (const char*)B->Name);
+};
+
+inline s32
 StringCompare(const void * A_, const void * B_)
 {
   string_entry * A = (string_entry*)A_;
@@ -262,6 +318,86 @@ StringCompare(const void * A_, const void * B_)
   return strcmp((const char*)A->Name, (const char*)B->Name);
 };
 
+u8 ReverseBits(u8 b)
+{
+    return (b * 0x0202020202ULL & 0x010884422010ULL) % 0x3ff;
+}
+
+
+struct number_lut_element{
+        u16 E[16];
+};
+number_lut_element NumberLUT[] =
+{
+  {0, 0, 0, 0, 0},
+  {1, 0, 0, 0, 0},
+  {0, 1, 0, 0, 0},
+  {10, 1, 0, 0, 0},
+  {0, 0, 1, 0, 0},
+  {100, 0, 1, 0, 0}, // 3
+  {0, 10, 1, 0, 0},
+  {100, 10, 1, 0, 0},
+  {0, 0, 0, 1, 0},
+  {1000, 0, 0, 1, 0},
+  {0, 100, 0, 1, 0},
+  {1000, 100, 0, 1, 0}, // 4
+  {0, 0, 10, 1, 0},
+  {1000, 0, 10, 1, 0},
+  {0, 100, 10, 1, 0},
+  {1000, 100, 10, 1, 0},
+  {0, 0, 0, 0, 1},
+  {10000, 0, 0, 0, 1},
+  {0, 1000, 0, 0, 1},
+  {10000, 1000, 0, 0, 1},
+  {0, 0, 100, 0, 1},
+  {10000, 0, 100, 0, 1},
+  {0, 1000, 100, 0, 1},
+  {10000, 1000, 100, 0, 1}, // 5
+  {0, 0, 0, 10, 1},
+  {10000, 0, 0, 10, 1},
+  {0, 1000, 0, 10, 1},
+  {10000, 1000, 0, 10, 1},
+  {0, 0, 100, 10, 1},
+  {10000, 0, 100, 10, 1},
+  {0, 1000, 100, 10, 1},
+  {10000, 1000, 100, 10, 1},
+};
+
+u16 OffsetLUT[ArrayCount(NumberLUT)] =
+{
+  0,
+  0,
+  0,
+  0,
+  0,
+  3, // 3
+  0,
+  0,
+  0,
+  0,
+  0,
+  4, // 4
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  5, // 5
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0
+};
 
 THREAD_ENTRYPOINT(ParseChunks)
 {
@@ -284,18 +420,24 @@ THREAD_ENTRYPOINT(ParseChunks)
 
 
   u32 ParsedCount = 0;
+  u8 * Strings = Input->StringMemory;
+  u64 Allocated = 0;
   while(!Buffer.ReachedEndOfBuffer)
   {
     // Parse name
     u64 Key = 0;
+    u8 * Start = Strings;
     while(Current(&Buffer) != ';')
     {
       Key ^= Current(&Buffer);
+      *Strings++ = Current(&Buffer);
       Key *= 16777619;
       AdvanceBuffer(&Buffer, false);
     }
 
     // Skip the ';'
+    *Strings++ = '\0';
+
     AdvanceBuffer(&Buffer, false);
 
     b32 Sign = Current(&Buffer) == '-';
@@ -305,11 +447,7 @@ THREAD_ENTRYPOINT(ParseChunks)
     }
     s32 Number = 0;
     
-    // Read 8 u8s in unaligned
-    // Subtract '0' from each
-    // Create a mask if they're < 9
-    // Some sort of table lookup of what to multiply with 
-    // Multiply and horizontal sum
+    #if 0
     while(Current(&Buffer) != '\r')
     {
       u8 Digit = Current(&Buffer) - '0';
@@ -320,18 +458,84 @@ THREAD_ENTRYPOINT(ParseChunks)
         Number += Digit;
       }
     }
+    Assert(Result == Number);
     Number = Sign ? -Number : Number;
+    #else
+
+    __m128i D = _mm_loadu_si128((__m128i*)(Buffer.Memory + Buffer.Offset));
+    __m128i Zero = _mm_set1_epi8(-1);
+    __m128i ZeroA = _mm_set1_epi8('0');
+    __m128i Nine = _mm_set1_epi8(10);
+    __m128i Diff = _mm_sub_epi8(D, ZeroA);
+    __m128i MaskGT = _mm_cmpgt_epi8(Diff, Zero);
+    __m128i MaskLT = _mm_cmplt_epi8(Diff, Nine);
+    __m128i Mask128 = _mm_and_si128(MaskGT, MaskLT);
+    u32 Mask       = _mm_movemask_epi8(Mask128);
+    Mask &= 0b11111;
+
+
+    __m128i MulMask = *(__m128i*)&NumberLUT[Mask];
+    u32 ExtraOffset = OffsetLUT[Mask];
+    Buffer.Offset += ExtraOffset;
+
+    __m128i A = MulMask;
+    __m128i B = _mm_unpacklo_epi8(Diff, _mm_setzero_si128());
+
+    __m128i P = _mm_mullo_epi16(A, B);
+
+    __m128i Sum32 = _mm_add_epi32(_mm_unpacklo_epi16(P, _mm_setzero_si128()),
+                                  _mm_unpackhi_epi16(P, _mm_setzero_si128())
+                                  );
+
+    __m128i S1 = _mm_add_epi32(Sum32, _mm_shuffle_epi32(Sum32, _MM_SHUFFLE(2, 3, 0, 1)));
+    __m128i S2 = _mm_add_epi32(S1, _mm_shuffle_epi32(S1, _MM_SHUFFLE(1, 0, 3, 2)));
+
+    s32 Result = _mm_cvtsi128_si32(S2);
+
+
+    Result = Sign ? -Result : Result;
+    Number = Result;
+    #endif
+    
 
     AdvanceBuffer(&Buffer, false);
     AdvanceBuffer(&Buffer, false);
 
-    weather_entry * Entry = LookupOrAddEntry(Input->Table, Key);
+    weather_entry * Entry = LookupOrAddEntry(Input->Table, Key, Start);
+    if(Entry->New)
+    {
+      Entry->New = false;
+      Allocated += (u64)Strings - (u64)Start;
+      // Add to global string table
+      AddToGlobalStringTable(Entry->Key, Start);
+    }
+    else
+    {
+      Strings = Start;
+    }
 
     Entry->Min = Min(Number, Entry->Min);
     Entry->Max = Max(Number, Entry->Max);
     Entry->Sum += Number;
     Entry->Count++;
+    ParsedCount++;
   }
+
+  weather_entry * SortedEntry = Input->Entries;
+  u32 EntryCount = 0;
+  for(u32 Index = 0;
+      Index < 1024 * 16;
+      Index++)
+  {
+    weather_entry * Entry = Input->Table + Index;
+    if(Entry->Key)
+    {
+      *SortedEntry++ = *Entry;
+      EntryCount++;
+    }
+  }
+
+  qsort(Input->Entries, EntryCount, sizeof(weather_entry), WeatherCompare);
 
   return 0;
 }
@@ -354,15 +558,17 @@ main(int ArgCount, char** Args)
     u8 * FileMemory = 0;
     {
       TimeBlock("Read");
-      HANDLE File = CreateFileA(Args[1], GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, 0,
+      HANDLE File = CreateFileA(Args[1], GENERIC_READ, FILE_SHARE_READ, 0,
                                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
       HANDLE Mapping = CreateFileMappingA(File, 0, PAGE_READONLY, 0, 0, 0);
       FileMemory = (u8*)MapViewOfFile(Mapping, FILE_MAP_READ, 0, 0, 0);
     }
 
     u64 MemoryPerThread = FileSize / MAX_THREAD_COUNT;
+    GlobalStringTable       = AllocateStruct(1024 * 16, string_entry);
 
     parse_chunks_input ParseInputs[MAX_THREAD_COUNT] = {};
+    weather_entry * SortedEntries[MAX_THREAD_COUNT] = {};
     {
       TimeBlock("Parsing");
 
@@ -372,7 +578,10 @@ main(int ArgCount, char** Args)
       {
         parse_chunks_input * ParseInput = ParseInputs + ParseThreadIndex;
 
-        ParseInput->Table       = AllocateStruct(1024 * 16, weather_entry);
+        ParseInput->Table       = AllocateStruct(1024 * 16 + 10000, weather_entry);
+        ParseInput->Entries = ParseInput->Table + 1024 * 16;
+        ParseInput->StringMemory = (u8*)Allocate(Megabyte(100));
+        SortedEntries[ParseThreadIndex] = ParseInput->Entries;
         ParseInput->ThreadIndex = (u32)ParseThreadIndex;
         ParseInput->FileMemory  = FileMemory + (ParseThreadIndex * MemoryPerThread);
         ParseInput->MemorySize  = MemoryPerThread;
@@ -384,19 +593,90 @@ main(int ArgCount, char** Args)
         ThreadHandles[ParseThreadIndex] = CreateThread(0, 0, ParseChunks, ParseInput, 0, 0);
       }
 
-      for(u32 ParseThreadIndex = 0;
-          ParseThreadIndex < MAX_THREAD_COUNT;
-          ParseThreadIndex++)
-      {
-        WaitForSingleObject(ThreadHandles[ParseThreadIndex], INFINITE);
-      }
+    }
+    for(u32 ParseThreadIndex = 0;
+        ParseThreadIndex < MAX_THREAD_COUNT;
+        ParseThreadIndex++)
+    {
+      WaitForSingleObject(ThreadHandles[ParseThreadIndex], INFINITE);
     }
 
+    {
+      TimeBlock("Printing");
 
-    printf("---\n");
-    EndAndPrintProfile(Stat.st_size, __COUNTER__ + 1);
+      string_entry * Strings = AllocateStruct(TotalStringEntries, string_entry);
+      string_entry * Curr = Strings;
+      for(u32 Index = 0;
+          Index < 1024 * 16;
+          Index++)
+      {
+        string_entry * Entry = (string_entry*)GlobalStringTable + Index;
+        if(Entry->Key)
+        {
+          *Curr++ = *Entry;
+        }
+      }
+
+      qsort(Strings, TotalStringEntries, sizeof(string_entry), StringCompare);
 
 
+      u32 BufferIndices[MAX_THREAD_COUNT] = {};
+
+      u8 * Memory = (u8*)Allocate(Megabyte(2));
+
+      u32 Offset = 0;
+      u8 * Start = Memory;
+      for(u32 StringIndex = 0;
+          StringIndex < TotalStringEntries;
+          StringIndex++)
+      {
+        string_entry * StringEntry = Strings + StringIndex;
+        weather_entry FinalWeatherEntry = {};
+        FinalWeatherEntry.Min = INT_MAX;
+        FinalWeatherEntry.Max = -INT_MAX;
+        for(u32 BufferIndex = 0;
+            BufferIndex < ArrayCount(BufferIndices);
+            BufferIndex++)
+        {
+          weather_entry * Buffer = SortedEntries[BufferIndex];
+          u32 CurrentIndex       = BufferIndices[BufferIndex];
+          weather_entry * Entry = Buffer + CurrentIndex;
+
+          if(Entry->Key == StringEntry->Key)
+          {
+            FinalWeatherEntry.Count += Entry->Count;
+            FinalWeatherEntry.Min = Min(FinalWeatherEntry.Min, Entry->Min);
+            FinalWeatherEntry.Max = Max(FinalWeatherEntry.Max, Entry->Max);
+            FinalWeatherEntry.Sum += Entry->Sum;
+            BufferIndices[BufferIndex]++;
+          }
+        }
+
+        f32 Mean    = FinalWeatherEntry.Sum / (10.0f * (f32)FinalWeatherEntry.Count);
+        f32 Minimum = FinalWeatherEntry.Min / 10.0f;
+        f32 Maximum = FinalWeatherEntry.Max / 10.0f;
+
+        u32 Written = sprintf((char*)Memory, "%s=%.1f/%.1f/%.1f, ", StringEntry->Name, Minimum,
+                          Mean, Maximum);
+        Offset += Written;
+        Memory += Written;
+      }
+
+        #if 1
+      printf("{%.*s}\n", Offset, Start);
+#else
+      FILE * File;
+      fopen_s(&File, "out.txt", "w");
+
+      fprintf(File, "{%.*s}\n", Offset,Start);
+
+#endif
+
+      printf("---\n");
+      EndAndPrintProfile(Stat.st_size, __COUNTER__ + 1);
+
+
+    }
   }
   else
   {
