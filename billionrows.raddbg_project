@@ -1,6 +1,12 @@
 // raddbg 0.9.19 project file
 
 recent_file: path: "src/main.cpp"
+recent_file: path: "D:/a/_work/1/s/src/vctools/crt/vcruntime/src/string/amd64/memset.asm"
+recent_file: path: "D:/os/obj/amd64fre/minkernel/crts/ucrt/src/appcrt/filesystem/mt/objfre/amd64/minkernel/crts/ucrt/src/appcrt/filesystem/stat.cpp"
+recent_file: path: "src/profiler.cpp"
+recent_file: path: "src/profiler.h"
+recent_file: path: "D:/a/_work/1/s/src/vctools/crt/vcruntime/src/string/amd64/memcpy.asm"
+recent_file: path: "../../Program Files (x86)/Windows Kits/10/include/10.0.22621.0/ucrt/stdio.h"
 recent_file: path: "D:/a/_work/1/s/src/vctools/crt/vcstartup/src/startup/exe_common.inl"
 recent_file: path: "D:/os/obj/amd64fre/minkernel/crts/ucrt/src/appcrt/misc/mt/objfre/amd64/minkernel/crts/ucrt/src/appcrt/misc/invalid_parameter.cpp"
 recent_file: path: "src/platform.h"
@@ -52,7 +58,7 @@ recent_file: path: "../Rendering/src/projection.cpp"
 target:
 {
   executable: "build/main.exe"
-  working_directory: ""
+  working_directory: "build/"
   enabled: 1
-  arguments: "measurements1b.txt"
+  arguments: "../measurements10k.txt"
 }

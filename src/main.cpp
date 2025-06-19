@@ -1,3 +1,8 @@
+
+#define TRACY_ENABLE 1
+#include "tracy/public/tracy/Tracy.hpp"
+#include "tracy/public/TracyClient.cpp"
+
 #include <windows.h>
 #include <stdint.h>
 #include <sys/stat.h>
@@ -24,11 +29,15 @@ typedef bool b32;
 #define Gigabyte(B) (Megabyte(B) * 1024LL)
 #define ArrayCount(Array) (sizeof(Array) / sizeof(Array[0]))
 
+#define PROFILER 0
+
 #define Assert(Expr)\
   if(!(Expr))\
     *(int*)0 = 5;
 
 #include "repetition.cpp"
+#include "profiler.h"
+#include "profiler.cpp"
 
 #define THREAD_ENTRYPOINT(Name) DWORD Name(void * RawInput)
 typedef THREAD_ENTRYPOINT(thread_entrypoint);
@@ -47,15 +56,18 @@ struct chunk
   u64           Size;
 
   volatile u32  Lock;
-  b32           Done;
+  volatile u32  WrittenTo;
+  b32           Parsed;
 };
 
 struct read_file_in_chunks_input
 {
   chunk * Chunks;
   char * Path;
+  u8* PrintMemory;
   u64 ChunkCount;
   u64 ChunkSize;
+  u32 PrintMemorySize;
 };
 
 struct flag_table
@@ -68,7 +80,9 @@ struct flag_table
 struct weather_entry
 {
   volatile b32 Written;
+  volatile b32 Done;
   u64 Key;
+
   s64 Sum;
   s32 Min;
   s32 Max;
@@ -80,14 +94,16 @@ struct parse_chunks_input
   weather_entry * Table; // Always 1024 * 16 sized
   chunk * Chunks;
   u32     ChunkCount;
+  u32     ThreadIndex;
 };
 
 
 struct chunk_buffer
 {
   u8 * Memory;
-  u8 * End;
-  u8 ** Next;
+  u64 Offset;
+  u64 Size;
+  u8 * Next;
   b32 ReachedEndOfBuffer;
 };
 struct string_entry
@@ -99,12 +115,13 @@ struct string_entry
 
 struct parse_string_hashes_input
 {
+  chunk* Chunks;
+  string_entry* Table;
   arena Arena;
-  chunk * Chunks;
   u32 ChunkCount;
 };
 
-#define MAX_THREAD_COUNT 3
+#define MAX_THREAD_COUNT 16
 
 string_entry * GlobalStringTable; // Array of 10k
 u32 GlobalStringCount = 0;
@@ -124,31 +141,32 @@ Allocate(u64 Size)
 }
 #define AllocateStruct(Size, Type) (Type*)Allocate(Size * sizeof(Type))
 
-inline void 
-AdvanceBuffer(chunk_buffer * Buffer)
+inline u8 
+Current(chunk_buffer * Buffer)
 {
-  Assert(Buffer->Memory < Buffer->End);
-  Buffer->Memory++;
-  if(Buffer->Memory == Buffer->End)
+  return *(Buffer->Memory + Buffer->Offset);
+}
+
+inline void 
+AdvanceBuffer(chunk_buffer * Buffer, b32 InName)
+{
+  Assert(Buffer->Offset < Buffer->Size);
+  Buffer->Offset++;
+  if(Buffer->Offset == Buffer->Size)
   {
     Assert(!Buffer->ReachedEndOfBuffer);
 
-    Buffer->Memory = *Buffer->Next;
+    if(InName)
+    {
+      int a = 5;
+    }
+
+    Buffer->Memory = Buffer->Next;
+    Buffer->Offset = 0;
     Buffer->ReachedEndOfBuffer = true;
   }
 }
 
-inline u64
-Hash(u32 a)
-{
-  u64 h = a;
-  h ^= h >> 33;
-  h *= 0xff51afd7ed558ccdL;
-  h ^= h >> 33;
-  h *= 0xc4ceb9fe1a85ec53L;
-  h ^= h >> 33;
-  return h;
-}
 
 inline s32
 Min(s32 a, s32 b)
@@ -220,25 +238,29 @@ AtomicCompareExchange(volatile u32* Dest, u32 Exchange, u32 Compare)
 }
 
 inline b32
-StringAlreadyExists(u64 Key)
+StringAlreadyExists(string_entry * Table, u64 Key)
 {
-  b32 Result = false;
-  for(u32 Index = 0;
-      Index < GlobalStringCount;
-      Index++)
+  u32 Mask = (1024 * 16) - 1;
+  u32 Index = Key & Mask;
+
+  while(true)
   {
-    string_entry * Entry = GlobalStringTable + Index;
+    string_entry * Entry = Table + Index;
     if(Entry->Key == Key)
     {
-      Result = true;
-      break;
+      return true;
     }
+    if(Entry->Key == 0)
+    {
+      Entry->Key = Key;
+      return false;
+    }
+    Index = (Index + 1) & Mask;
   }
-
-  return Result;
 }
 
-s32 StringCompare(const void * A_, const void * B_)
+inline s32
+StringCompare(const void * A_, const void * B_)
 {
   string_entry * A = (string_entry*)A_;
   string_entry * B = (string_entry*)B_;
@@ -251,6 +273,7 @@ s32 StringCompare(const void * A_, const void * B_)
 void
 PrintSortedEntryLists(u8 * Memory, u32 Size)
 {
+  ZoneScopedN("Print the sorted entries");
   while(!GlobalFlagTable->FinishedSorting)
   {
     // Some intrinsic here for waiting?
@@ -276,9 +299,13 @@ PrintSortedEntryLists(u8 * Memory, u32 Size)
       u32 CurrentIndex       = BufferIndices[BufferIndex];
 
       weather_entry * Entry = Buffer + CurrentIndex;
-      while(!Entry->Written)
+      while(!Entry->Written && !Entry->Done)
       {
         // Intrinsic?
+      }
+      if(Entry->Done)
+      {
+        continue;
       }
 
       if(Entry->Key == StringEntry->Key)
@@ -301,55 +328,76 @@ PrintSortedEntryLists(u8 * Memory, u32 Size)
     Memory += Written;
   }
 
+  #if 0
   printf("{%.*s}\n", Offset, Start);
+#else
+  FILE * File;
+  fopen_s(&File, "out.txt", "w");
+
+  fprintf(File, "{%.*s}\n", Offset,Start);
+
+#endif
 
 }
 
 
 THREAD_ENTRYPOINT(ReadFileInChunks)
 {
+  ZoneScopedN("Read the file in chunks");
   read_file_in_chunks_input *Input = (read_file_in_chunks_input*)RawInput;
-
-  struct __stat64 Stat;
-  _stat64(Input->Path, &Stat);
-  HANDLE File = CreateFileA(Input->Path, GENERIC_READ, FILE_SHARE_READ, 0,
-                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
-
-  u64 BytesRemaining  = Stat.st_size;
-  u64 ChunkSize       = Input->ChunkSize;
-  u64 ChunkMask       = Input->ChunkCount - 1;
-  ChunkMask = 1; // ToDO remove!!
-  chunk * Chunks         = Input->Chunks;
-
-  u32 BytesRead   = 0;
-  u64 ChunkIndex  = 0;
-
-  b32 FirstLap = true;
-
-  while(BytesRemaining)
+  TimeBlock("Reading");
   {
-    chunk* Chunk = Chunks + (ChunkIndex * ChunkSize);
-    ChunkIndex = (ChunkIndex + 1) & ChunkMask;
-    FirstLap &= ChunkIndex == 0 ? false : true;
-    Assert(Chunk->Done || FirstLap);
 
-    u64 ToRead = BytesRemaining < ChunkSize ? BytesRemaining : ChunkSize;
+    struct __stat64 Stat;
+    _stat64(Input->Path, &Stat);
+    HANDLE File = CreateFileA(Input->Path, GENERIC_READ, FILE_SHARE_READ, 0,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
 
-    Chunk->Size = ToRead;
-    if(!ReadFile(File, Chunk->Memory, ToRead, (LPDWORD)&BytesRead, 0))
+    u64 BytesRemaining  = Stat.st_size;
+    u64 ChunkSize       = Input->ChunkSize;
+    u64 ChunkMask       = Input->ChunkCount - 1;
+    chunk * Chunks         = Input->Chunks;
+
+    u32 BytesRead   = 0;
+    u64 ChunkIndex  = 0;
+
+    chunk * PrevChunk = 0;
+    while(BytesRemaining)
     {
-      u32 Error = GetLastError();
-      int a = 5;
+      chunk* Chunk = Chunks + ChunkIndex;
+      ChunkIndex = (ChunkIndex + 1) & ChunkMask;
+      Assert(Chunk->Parsed);
+
+      u64 ToRead = BytesRemaining < ChunkSize ? BytesRemaining : ChunkSize;
+
+      Chunk->Size = ToRead;
+      if(!ReadFile(File, Chunk->Memory, ToRead, (LPDWORD)&BytesRead, 0))
+      {
+        u32 Error = GetLastError();
+        int a = 5;
+      }
+      if(PrevChunk)
+      {
+        PrevChunk->Next   = Chunk->Memory;
+        PrevChunk->Parsed = false;
+        PrevChunk->WrittenTo = true;
+        GlobalFlagTable->TotalChunkCount++;
+      }
+      PrevChunk = Chunk;
+      BytesRemaining -= ToRead;
     }
-    BytesRemaining -= ToRead;
+    PrevChunk->Parsed = false;
+    PrevChunk->WrittenTo = true;
     GlobalFlagTable->TotalChunkCount++;
-    Chunk->Done = false;
+
+    GlobalFlagTable->FinishedReading = true;
+
+    CloseHandle(File);
   }
 
-  GlobalFlagTable->FinishedReading = true;
-
-  CloseHandle(File);
-
+  #if 0
+  PrintSortedEntryLists(Input->PrintMemory, Input->PrintMemorySize);
+#endif
 
   return 0;
 }
@@ -357,14 +405,16 @@ THREAD_ENTRYPOINT(ReadFileInChunks)
 
 
 void 
-ProduceSortedEntryList(weather_entry * EntryTable)
+ProduceSortedEntryList(weather_entry * EntryTable, u32 ThreadIndex)
 {
+  ZoneScopedN("Produce sorted entry list");
   while(!GlobalFlagTable->FinishedSorting)
   {
     // Some intrinsic here for waiting?
   }
 
-  weather_entry * Buffer = GlobalEntryList[0];
+  weather_entry * Buffer = GlobalEntryList[ThreadIndex];
+  weather_entry * LastBuffer = Buffer + 10000;
   for(u32 StringIndex = 0;
       StringIndex < GlobalStringCount;
       StringIndex++)
@@ -379,150 +429,172 @@ ProduceSortedEntryList(weather_entry * EntryTable)
       Buffer++;
     }
   }
+  if(Buffer < LastBuffer)
+  {
+    Buffer->Done = true;
+  }
 }
 
 
 THREAD_ENTRYPOINT(ParseChunks)
 {
+  ZoneScopedN("Parse Chunk");
   u64 ChunkIndex = 0;
   parse_chunks_input * Input = (parse_chunks_input*)RawInput;
 
-  while(true)
   {
-    chunk * Chunk = Input->Chunks + (ChunkIndex % Input->ChunkCount);
-
-    if(!Chunk->Done)
+    while(true)
     {
-      if(!Chunk->Lock)
+      chunk * Chunk = Input->Chunks + (ChunkIndex % Input->ChunkCount);
+
+      if(!Chunk->Parsed)
       {
-        b32 Lock;
-        Lock = AtomicCompareExchange(&Chunk->Lock, true, false);
-        if(!Lock)
+        if(!Chunk->Lock)
         {
-          Assert(Chunk->Lock);
-          if(ChunkIndex)
+          b32 Lock;
+          Lock = AtomicCompareExchange(&Chunk->Lock, true, false);
+          if(!Lock)
           {
-            while(*Chunk->Memory != '\n')
+            Assert(Chunk->Lock);
+            b32 ReachedEndOfBuffer = false;
+            chunk_buffer Buffer = {};
+            Buffer.ReachedEndOfBuffer = false;
+            Buffer.Memory = Chunk->Memory;
+            Buffer.Size   = Chunk->Size;
+            Buffer.Next   = Chunk->Next;
+            if(ChunkIndex)
             {
-              Chunk->Memory++;
-            }
-            Chunk->Memory++;
-          }
-
-          u8 * End = Chunk->Memory + Chunk->Size;
-          b32 ReachedEndOfBuffer = false;
-          chunk_buffer Buffer = {};
-          Buffer.ReachedEndOfBuffer = false;
-          Buffer.Memory = Chunk->Memory;
-          Buffer.End    = Chunk->Memory + Chunk->Size;
-          Buffer.Next   = &Chunk->Next;
-
-          while(!Buffer.ReachedEndOfBuffer)
-          {
-            // Parse name
-            u64 Key = 0;
-            while(*Buffer.Memory != ';')
-            {
-              Key += Hash(*Buffer.Memory);
-              AdvanceBuffer(&Buffer);
-            }
-
-            // Skip the ';'
-            AdvanceBuffer(&Buffer);
-
-            b32 Sign = false;
-            if(*Buffer.Memory == '-')
-            {
-              AdvanceBuffer(&Buffer);
-              Sign = true;
-            }
-            s32 Number = 0;
-            while(*Buffer.Memory != '\r')
-            {
-              u8 Digit = *Buffer.Memory - '0';
-              AdvanceBuffer(&Buffer);
-              Number *= 10;
-              if(Digit <= 9)
+              while(Current(&Buffer) != '\n')
               {
-                Number += Digit;
+                AdvanceBuffer(&Buffer, false);
               }
+              AdvanceBuffer(&Buffer, false);
             }
-            Number = Sign ? -Number : Number;
 
-            AdvanceBuffer(&Buffer);
-            AdvanceBuffer(&Buffer);
-            weather_entry * Entry = LookupOrAddEntry(Input->Table, Key);
 
-            Entry->Min = Min(Number, Entry->Min);
-            Entry->Max = Max(Number, Entry->Max);
-            Entry->Sum += Number;
-            Entry->Count++;
+            u32 ParsedCount = 0;
+            while(!Buffer.ReachedEndOfBuffer)
+            {
+              // Parse name
+              u64 Key = 0;
+              while(Current(&Buffer) != ';')
+              {
+                Key ^= Current(&Buffer);
+                Key *= 16777619;
+                AdvanceBuffer(&Buffer, false);
+              }
+
+              // Skip the ';'
+              AdvanceBuffer(&Buffer, false);
+
+              b32 Sign = false;
+              if(Current(&Buffer) == '-')
+              {
+                AdvanceBuffer(&Buffer, false);
+                Sign = true;
+              }
+              s32 Number = 0;
+              while(Current(&Buffer) != '\r')
+              {
+                u8 Digit = Current(&Buffer) - '0';
+                AdvanceBuffer(&Buffer, false);
+                Number *= 10;
+                if(Digit <= 9)
+                {
+                  Number += Digit;
+                }
+              }
+              Number = Sign ? -Number : Number;
+
+              AdvanceBuffer(&Buffer, false);
+              AdvanceBuffer(&Buffer, false);
+
+              weather_entry * Entry = LookupOrAddEntry(Input->Table, Key);
+
+              Entry->Min = Min(Number, Entry->Min);
+              Entry->Max = Max(Number, Entry->Max);
+              Entry->Sum += Number;
+              Entry->Count++;
+            }
+            Chunk->Parsed = true;
           }
         }
       }
-    }
-    if(ChunkIndex + 1 < GlobalFlagTable->TotalChunkCount)
-    {
-      ChunkIndex++;
-    }
+      if(ChunkIndex + 1 < GlobalFlagTable->TotalChunkCount)
+      {
+        ChunkIndex++;
+      }
 
-    if(GlobalFlagTable->FinishedReading && GlobalFlagTable->TotalChunkCount == ChunkIndex + 1)
-    {
-      break;
+      if(GlobalFlagTable->FinishedReading && GlobalFlagTable->TotalChunkCount == ChunkIndex + 1)
+      {
+        break;
+      }
     }
   }
 
-
+  // ProduceSortedEntryList(Input->Table, Input->ThreadIndex);
   return 0;
 }
 
 THREAD_ENTRYPOINT(ParseStringHashes)
 {
+  ZoneScopedN("Parse String Hashes");
   parse_string_hashes_input * Input = (parse_string_hashes_input*)RawInput;
   arena Arena = Input->Arena;
+  string_entry * Table = Input->Table;
 
   u64 ChunkIndex = 0;
+  while(!(volatile u32)GlobalFlagTable->TotalChunkCount)
+  {
+
+  }
   while(true)
   {
     chunk * Chunk = Input->Chunks + (ChunkIndex % Input->ChunkCount);
 
-    if(ChunkIndex)
-    {
-      while(*Chunk->Memory != '\n')
-      {
-        Chunk->Memory++;
-      }
-      Chunk->Memory++;
-    }
+    while(!Chunk->WrittenTo){}
 
     chunk_buffer Buffer = {};
     Buffer.ReachedEndOfBuffer = false;
     Buffer.Memory = Chunk->Memory;
-    Buffer.End    = Chunk->Memory + Chunk->Size;
-    Buffer.Next   = &Chunk->Next;
+    Buffer.Size   = Chunk->Size;
+    Buffer.Next   = Chunk->Next;
+    if(ChunkIndex)
+    {
+      while(Current(&Buffer) != '\n')
+      {
+        AdvanceBuffer(&Buffer, false);
+      }
+      AdvanceBuffer(&Buffer, false);
+    }
+
 
     while(!Buffer.ReachedEndOfBuffer)
     {
       // Parse name
       u64 Key = 0;
       u32 Offset = Arena.Offset;
+      u32 StringLength = 0;
       u8 * Start = Arena.Memory + Offset;
       u8 * Curr  = Start;
-      while(*Buffer.Memory != ';')
+      while(Current(&Buffer) != ';')
       {
-        Key    += Hash(*Buffer.Memory);
-        *Curr++ = *Buffer.Memory;
+        Key ^= Current(&Buffer);
+        Key *= 16777619;
+        *Curr++ = Current(&Buffer);
         Offset++;
         Assert(Offset < Arena.Size);
+        StringLength++;
 
-        AdvanceBuffer(&Buffer);
+        AdvanceBuffer(&Buffer, true);
       }
 
-      if(!StringAlreadyExists(Key))
+      if(!StringAlreadyExists(Table, Key))
       {
         *Curr = '\0';
         Arena.Offset = Offset + 1;
         Assert(Arena.Offset < Arena.Size);
+        Assert(GlobalStringCount < 10000);
 
         string_entry * Entry = GlobalStringTable + GlobalStringCount++;
         Entry->Key  = Key;
@@ -530,18 +602,18 @@ THREAD_ENTRYPOINT(ParseStringHashes)
       }
 
       // Skip the ';'
-      AdvanceBuffer(&Buffer);
+      AdvanceBuffer(&Buffer, false);
 
-      if(*Buffer.Memory == '-')
+      if(Current(&Buffer) == '-')
       {
-        AdvanceBuffer(&Buffer);
+        AdvanceBuffer(&Buffer, false);
       }
 
-      while(*Buffer.Memory != '\n')
+      while(Current(&Buffer) != '\n')
       {
-        AdvanceBuffer(&Buffer);
+        AdvanceBuffer(&Buffer, false);
       }
-      AdvanceBuffer(&Buffer);
+      AdvanceBuffer(&Buffer, false);
     }
 
     if(ChunkIndex + 1 < GlobalFlagTable->TotalChunkCount)
@@ -566,13 +638,16 @@ main(int ArgCount, char** Args)
 {
   if(ArgCount > 1)
   {
-    u64 CPUFreq = EstimateCPUTimerFreq();
+    FrameMark;
+    #if 1
+    BeginProfile();
+    #endif
 
-    u64 Start = ReadCPUTimer();
     flag_table Table = {};
     GlobalFlagTable = &Table;
 
     GlobalStringTable = AllocateStruct(10000, string_entry);
+    string_entry * StringTable = AllocateStruct(1024 * 16, string_entry);
     for(u32 Index = 0;
         Index < ArrayCount(GlobalEntryList);
         Index++)
@@ -588,42 +663,67 @@ main(int ArgCount, char** Args)
     Input.ChunkSize   = Gigabyte(18);
     Input.ChunkCount  = ChunkCount;
     Input.Chunks      = Chunks;
+    Input.PrintMemorySize = Megabyte(1);
+    Input.PrintMemory    = (u8*)Allocate(Input.PrintMemorySize);
     for(u32 ChunkIndex = 0;
         ChunkIndex < ChunkCount;
         ChunkIndex++)
     {
       Input.Chunks[ChunkIndex].Memory = AllocateStruct(Input.ChunkSize, u8);
+      Input.Chunks[ChunkIndex].Parsed = true;
     }
 
-    ReadFileInChunks(&Input);
+    HANDLE ThreadHandles[MAX_THREAD_COUNT - 1];
 
-    parse_chunks_input ParseInput = {};
-    ParseInput.Table      = AllocateStruct(1024 * 16, weather_entry);
-    ParseInput.Chunks     = Chunks;
-    ParseInput.ChunkCount = ChunkCount;
-    ParseChunks(&ParseInput);
+    ThreadHandles[0] = CreateThread(0, 0, ReadFileInChunks, &Input, 0, 0);
+
+    #if 0
+    parse_chunks_input ParseInputs[MAX_THREAD_COUNT - 2] = {};
+    for(u32 ParseThreadIndex = 0;
+        ParseThreadIndex < MAX_THREAD_COUNT - 2;
+        ParseThreadIndex++)
+    {
+      parse_chunks_input * ParseInput = ParseInputs + ParseThreadIndex;
+
+      ParseInput->Table      = AllocateStruct(1024 * 16, weather_entry);
+      ParseInput->Chunks     = Chunks;
+      ParseInput->ChunkCount = ChunkCount;
+      ParseInput->ThreadIndex = ParseThreadIndex;
+
+      ThreadHandles[1 + ParseThreadIndex] = CreateThread(0, 0, ParseChunks, ParseInput, 0, 0);
+    }
+    #endif
 
     parse_string_hashes_input HashInput = {};
     HashInput.Arena.Size = Megabyte(2);
     HashInput.Arena.Memory = (u8*)Allocate(HashInput.Arena.Size);
     HashInput.Chunks = Chunks;
     HashInput.ChunkCount = ChunkCount;
-    ParseStringHashes(&HashInput);
+    HashInput.Table = StringTable;
 
-    ProduceSortedEntryList(ParseInput.Table);
+    #if 0
+    ThreadHandles[MAX_THREAD_COUNT - 2] = CreateThread(0, 0, ParseStringHashes, &HashInput, 0, 0);
+    #endif
 
-    u32 PrintMemorySize = Megabyte(1);
-    u8 * PrintMemory    = (u8*)Allocate(PrintMemorySize);
-    PrintSortedEntryLists(PrintMemory, PrintMemorySize);
+    
 
+    #if 0
+    for(u32 ThreadIndex = 0;
+        ThreadIndex < MAX_THREAD_COUNT - 2;
+        ThreadIndex++)
+    {
+      WaitForSingleObject(ThreadHandles[ThreadIndex], INFINITE);
+    }
+    #endif
+    WaitForSingleObject(ThreadHandles[0], INFINITE);
+
+    #if 1
     struct __stat64 Stat;
     _stat64(Args[1], &Stat);
-    u64 End = ReadCPUTimer();
-    u64 TotalElapsed = End - Start;
-    u64 Size = Stat.st_size;
-    f64 TotalSeconds = (TotalElapsed / (f64)CPUFreq);
-    printf("Total time: %0.4fms\n", 1000.0 * (f64)TotalElapsed / (f64)CPUFreq);
-    printf("Filesize: %llu after %.2fs, mb/s:%.2f\n", Size, TotalSeconds, Size / (TotalSeconds * Megabyte(1)));
+    printf("---\n");
+    printf("Total strings: %u\n", GlobalStringCount);
+    EndAndPrintProfile(Stat.st_size, __COUNTER__ + 1);
+    #endif
 
 
   }
