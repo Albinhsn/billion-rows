@@ -425,7 +425,7 @@ THREAD_ENTRYPOINT(ParseChunks)
   while(!Buffer.ReachedEndOfBuffer)
   {
     // Parse name
-    u64 Key = 0;
+    u64 Key = 2166136261u;
     u8 * Start = Strings;
     while(Current(&Buffer) != ';')
     {
