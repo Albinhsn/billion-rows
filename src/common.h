@@ -3,15 +3,6 @@
 
 #define ArrayCount(Array) (sizeof(Array) / sizeof((Array)[0]))
 
-#include <cstdio>
-#include <math.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <sys/time.h>
-#include <x86intrin.h>
-
-#include <time.h>
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
@@ -25,7 +16,7 @@ typedef int16_t i16;
 typedef int i32;
 typedef int64_t i64;
 
-typedef struct Vec3f32;
+typedef struct Vec3f32 Vec3f32;
 
 #define PROFILER 1
 

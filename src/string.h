@@ -1,10 +1,7 @@
 #ifndef STA_STRING_H
 #define STA_STRING_H
 
-#include "common.h"
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
+
 struct String
 {
   u64 len;

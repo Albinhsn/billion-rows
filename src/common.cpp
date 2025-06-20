@@ -1,5 +1,3 @@
-#include "common.h"
-#include <stdio.h>
 
 Profiler      profiler;
 u32           globalProfilerParentIndex = 0;
@@ -9,7 +7,7 @@ static void   PrintTimeElapsed(ProfileAnchor* Anchor, u64 timerFreq, u64 TotalTS
 {
 
   f64 Percent = 100.0 * ((f64)Anchor->elapsedExclusive / (f64)TotalTSCElapsed);
-  printf("  %s[%lu]: %lu (%.2f%%", Anchor->label, Anchor->hitCount, Anchor->elapsedExclusive, Percent);
+  printf("  %s[%llu]: %llu (%.2f%%", Anchor->label, Anchor->hitCount, Anchor->elapsedExclusive, Percent);
   if (Anchor->elapsedInclusive != Anchor->elapsedExclusive)
   {
     f64 PercentWithChildren = 100.0 * ((f64)Anchor->elapsedInclusive / (f64)TotalTSCElapsed);
@@ -31,18 +29,16 @@ static void   PrintTimeElapsed(ProfileAnchor* Anchor, u64 timerFreq, u64 TotalTS
 }
 static u64 GetOSTimerFreq(void)
 {
-  return 1000000;
+  LARGE_INTEGER Freq;
+	QueryPerformanceFrequency(&Freq);
+	return Freq.QuadPart;
 }
 
 static u64 ReadOSTimer(void)
 {
-  // NOTE(casey): The "struct" keyword is not necessary here when compiling in C++,
-  // but just in case anyone is using this file from C, I include it.
-  struct timeval Value;
-  gettimeofday(&Value, 0);
-
-  u64 Result = GetOSTimerFreq() * (u64)Value.tv_sec + (u64)Value.tv_usec;
-  return Result;
+  LARGE_INTEGER Value;
+	QueryPerformanceCounter(&Value);
+	return Value.QuadPart;
 }
 
 /* NOTE(casey): This does not need to be "inline", it could just be "static"
@@ -103,7 +99,7 @@ void displayProfilingResult()
 
   f64 tot = 1000.0 * (f64)totalElapsed / (f64)cpuFreq;
   profiler.bestTime = tot < profiler.bestTime ? tot : profiler.bestTime; 
-  printf("\nTotal time: %0.4fms (CPU freq %lu)\n", tot, cpuFreq);
+  printf("\nTotal time: %0.4fms (CPU freq %llu)\n", tot, cpuFreq);
   for (u32 i = 0; i < ArrayCount(globalProfileAnchors); i++)
   {
     ProfileAnchor* profile = globalProfileAnchors + i;

@@ -7,3 +7,9 @@ profile.txt
 cachegrind*
 perf.data
 annotated.txt
+*tracy/
+*.exe
+*.ilk
+*.pdb
+*.rdi
+build/

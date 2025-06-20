@@ -1,6 +1,5 @@
 #ifndef ARENA_H
 #define ARENA_H
-#include "./common.h"
 
 struct Arena
 {
