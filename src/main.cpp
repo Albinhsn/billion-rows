@@ -561,8 +561,20 @@ main(int ArgCount, char** Args)
       TimeBlock("Read");
       HANDLE File = CreateFileA(Args[1], GENERIC_READ, FILE_SHARE_READ, 0,
                                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+      #if 0
+      FileMemory = (u8*)Allocate(FileSize);
+      LONGLONG Offset = 0;
+      DWORD BytesRead;
+      while(Offset < FileSize)
+      {
+        SetFilePointerEx(File, (LARGE_INTEGER)Offset, 0, FILE_BEGIN);
+        ReadFile(File, FileMemory + Offset, min(1ULL << 30, FileSize - Offset), &BytesRead, 0);
+        Offset += BytesRead;
+      }
+      #else
       HANDLE Mapping = CreateFileMappingA(File, 0, PAGE_READONLY, 0, 0, 0);
       FileMemory = (u8*)MapViewOfFile(Mapping, FILE_MAP_READ, 0, 0, 0);
+      #endif
     }
 
     u64 MemoryPerThread = FileSize / MAX_THREAD_COUNT;
