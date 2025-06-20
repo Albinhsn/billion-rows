@@ -29,16 +29,29 @@ static void   PrintTimeElapsed(ProfileAnchor* Anchor, u64 timerFreq, u64 TotalTS
 }
 static u64 GetOSTimerFreq(void)
 {
+  #if WIN32
   LARGE_INTEGER Freq;
 	QueryPerformanceFrequency(&Freq);
 	return Freq.QuadPart;
+  #else
+  return 420000000; 
+#endif
 }
 
 static u64 ReadOSTimer(void)
 {
+  #if WIN32
   LARGE_INTEGER Value;
 	QueryPerformanceCounter(&Value);
 	return Value.QuadPart;
+  #else
+  struct timeval Value;
+  gettimeofday(&Value, 0);
+
+  u64 Result = GetOSTimerFreq() * (u64)Value.tv_sec + (u64)Value.tv_usec;
+  return Result;
+  #endif
+
 }
 
 /* NOTE(casey): This does not need to be "inline", it could just be "static"

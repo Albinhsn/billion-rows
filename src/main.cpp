@@ -1,12 +1,20 @@
 #include <stdint.h>
 #include <stdio.h>
-#include <windows.h>
 #include <sys/stat.h>
 #include <cfloat>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 
+#if WIN32
+#include <windows.h>
+#else
+#include <sys/time.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <x86intrin.h>
+
+#endif
 
 #include "common.h"
 #include "common.cpp"
@@ -53,7 +61,45 @@ u8*                fileContent;
 inline void * 
 Allocate(u64 Size)
 {
+  #if WIN32
   return VirtualAlloc(0, Size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  #else
+  return mmap(0, Size, PROT_READ | PROT_WRITE, MAP_POPULATE, 0, 0); 
+#endif
+}
+
+#if WIN32
+typedef DWORD thread_return_type;
+typedef HANDLE thread_handle;
+#else
+typedef void* thread_return_type;
+typedef pthread_t thread_handle;
+#endif
+
+#define THREAD_ENTRYPOINT(Name) thread_return_type Name(void* Args);
+typedef THREAD_ENTRYPOINT(thread_entrypoint);
+
+
+thread_handle
+ThreadCreate(thread_entrypoint * Entrypoint, void * Args)
+{
+  thread_handle Result;
+  #if WIN32
+  Result = CreateThread(0, 0, Entrypoint, Args, 0, 0);
+#else
+  pthread_create(&Result, 0, Entrypoint, Args);
+#endif
+  return Result;
+}
+
+void
+ThreadJoin(thread_handle Handle)
+{
+  #if WIN32
+  WaitForSingleObject(Handle, INFINITE);
+#else
+  pthread_join(Handle, 0);
+#endif
 }
 
 
@@ -281,7 +327,7 @@ static inline void parseSum(Value* value, Buffer* buffer)
   value->min   = v;
 }
 
-DWORD parsePairs(void* args_)
+thread_return_type parsePairs(void* args_)
 {
   ParsePairsArgs* parsePairsArgs = (ParsePairsArgs*)args_;
   HashMap*        map            = parsePairsArgs->map;
@@ -321,14 +367,32 @@ DWORD parsePairs(void* args_)
 
 
 
-DWORD touchyTouchy(void* args)
+thread_return_type touchyTouchy(void* args)
 {
   u64 fileSize = *(u64*)args;
   for (u32 i = 0; i < fileSize; i++)
   {
-    u8 Read = fileContent[i];
+    (void)fileContent[i];
   }
   return 0;
+}
+
+u8* MapFile(char * Path)
+{
+  #if WIN32
+  HANDLE File = CreateFileA(Path, GENERIC_READ, FILE_SHARE_READ, 0,
+                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+  HANDLE Mapping = CreateFileMappingA(File, 0, PAGE_READONLY, 0, 0, 0);
+  return (u8*)MapViewOfFile(Mapping, FILE_MAP_READ, 0, 0, 0);
+  #else
+  int         fd = open(Path, O_RDONLY);
+  struct stat fileStat;
+  fstat(fd, &fileStat);
+
+  size_t fileSize = fileStat.st_size;
+  return (u8*)mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+#endif
+
 }
 
 int main(int argc, char** argv)
@@ -338,21 +402,24 @@ int main(int argc, char** argv)
 
   initProfiler();
 
+  #if WIN32
   struct __stat64 fileStat;
   _stat64(argv[1], &fileStat);
+  #else
+  struct stat fileStat;
+  stat(argv[1], &fileStat);
+
+  #endif
 
   size_t fileSize = fileStat.st_size;
 
-  HANDLE File = CreateFileA(argv[1], GENERIC_READ, FILE_SHARE_READ, 0,
-                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
-  HANDLE Mapping = CreateFileMappingA(File, 0, PAGE_READONLY, 0, 0, 0);
-  fileContent = (u8*)MapViewOfFile(Mapping, FILE_MAP_READ, 0, 0, 0);
+  u8 * fileContent = MapFile(argv[1]);
 
   Arena          lastArena;
   Arena          arenas[NUMBER_OF_THREADS];
   HashMap        lastMap;
   HashMap        maps[NUMBER_OF_THREADS];
-  HANDLE         threadIds[1 + NUMBER_OF_THREADS];
+  thread_handle threadIds[1 + NUMBER_OF_THREADS];
   ParsePairsArgs args[NUMBER_OF_THREADS];
   Buffer         buffers[NUMBER_OF_THREADS];
 
@@ -369,7 +436,7 @@ int main(int argc, char** argv)
     };
 
     args[i] = (ParsePairsArgs){.buffer = buffers[i], .map = &maps[i], .arena = &arenas[i], .threadId = i};
-    threadIds[i] = CreateThread(0, 0, parsePairs, &args[i], 0, 0);
+    threadIds[i] = ThreadCreate(parsePairs, &args[i]);
   }
 
   lastArena.maxSize = 1024 * 1024 * 4;
@@ -380,7 +447,7 @@ int main(int argc, char** argv)
   // WaitForSingleObject(threadIds[NUMBER_OF_THREADS], INFINITE);
   for (u32 i = 0; i < NUMBER_OF_THREADS; i++)
   {
-    WaitForSingleObject(threadIds[i], INFINITE);
+    ThreadJoin(threadIds[i]);
     Key*   keys   = maps[i].keys;
     Value* values = maps[i].values;
     for (u64 j = 0; j < maps[i].cap; j++)

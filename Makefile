@@ -1,20 +1,10 @@
-CC := g++
-CFLAGS := -flto -march=native -mtune=native -pthread -O2 -Wall -Wno-missing-braces
+CC := clang++-18
+CFLAGS := -flto -march=native -mtune=native -pthread -O2 -Wno-missing-braces
 TARGET := main 
 
-SRCS = $(wildcard src/*.cpp)
-OBJS = $(patsubst src/%.cpp,obj/%.o,$(SRCS))
 
-b: $(TARGET)
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ -lm
-
-obj/%.o: src/%.cpp
-	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-r:
-	./main > image.ppm && display image.ppm
+b: 
+	$(CC) ./src/main.cpp -o $(TARGET) $(CFLAGS)
 
 len:
 	find . -name '*.cpp' | xargs wc -l
