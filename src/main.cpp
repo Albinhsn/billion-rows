@@ -1,5 +1,5 @@
 
-#if 1
+#if 0
 #define TRACY_ENABLE 1
 #include "tracy/public/tracy/Tracy.hpp"
 #include "tracy/public/TracyClient.cpp"
@@ -429,8 +429,9 @@ THREAD_ENTRYPOINT(ParseChunks)
     u8 * Start = Strings;
     while(Current(&Buffer) != ';')
     {
-      Key ^= Current(&Buffer);
-      *Strings++ = Current(&Buffer);
+      u8 C = Current(&Buffer);
+      Key ^= C;
+      *Strings++ = C;
       Key *= 16777619;
       AdvanceBuffer(&Buffer, false);
     }
