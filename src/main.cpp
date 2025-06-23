@@ -36,7 +36,7 @@ typedef bool b32;
 #define Gigabyte(B) (Megabyte(B) * 1024LL)
 #define ArrayCount(Array) (sizeof(Array) / sizeof(Array[0]))
 
-#define PROFILER 1
+#define PROFILER 0
 
 #define Assert(Expr)\
   if(!(Expr))\
@@ -99,18 +99,34 @@ struct parse_chunks_input
   weather_entry * Table; // Always 1024 * 16 sized
   weather_entry * Entries; // Always 10k
   u8 * StringMemory;
-  u8 * FileMemory;
-  u64 MemorySize;
+  
+  char * Path;
+
+  u8 * ChunkMemory;
+  u64  ChunkSize;
+
+  u64 FileOffset;
+  u64 BytesToProcess;
+
   u32 ThreadIndex;
 };
 
 
 struct chunk_buffer
 {
-  u8 * Memory;
-  u64 Offset;
-  u64 Size;
-  b32 ReachedEndOfBuffer;
+  // Thing we work on
+  u8*  ChunkMemory;
+  u64  ChunkOffset;
+  u64  ChunkSize;
+
+  // File we read from if we need more
+  HANDLE FileHandle;
+  u64    FileOffset;
+  u64    FileSize;
+
+  // Thing we need to figure out if we're done or have more to process
+  u64 BytesToProcess;
+  u64 BytesProcessed;
 };
 
 struct string_entry
@@ -151,16 +167,31 @@ Allocate(u64 Size)
 inline u8 
 Current(chunk_buffer * Buffer)
 {
-  return *(Buffer->Memory + Buffer->Offset);
+  return *(Buffer->ChunkMemory + Buffer->ChunkOffset);
+}
+
+inline u64 Min(u64 A, u64 B)
+{
+  return A < B ? A : B;
 }
 
 inline void 
 AdvanceBuffer(chunk_buffer * Buffer, b32 InName)
 {
-  Buffer->Offset++;
-  if(Buffer->Offset >= Buffer->Size)
+  Buffer->ChunkOffset++;
+  if(Buffer->ChunkOffset >= Buffer->ChunkSize)
   {
-    Buffer->ReachedEndOfBuffer = true;
+    Buffer->BytesProcessed += Buffer->ChunkSize;
+    u64 ToRead = Min(Buffer->ChunkSize, Buffer->FileSize - Buffer->FileOffset);
+    Buffer->ChunkSize = ToRead;
+
+    DWORD BytesRead = 0;
+    Assert(ReadFile(Buffer->FileHandle, Buffer->ChunkMemory, ToRead, &BytesRead, 0));
+    Assert(BytesRead == ToRead);
+
+    Buffer->ChunkOffset = 0;
+    Buffer->FileOffset += ToRead;
+
   }
 }
 
@@ -404,11 +435,30 @@ THREAD_ENTRYPOINT(ParseChunks)
   ZoneScopedN("Parse Chunk");
   parse_chunks_input * Input = (parse_chunks_input*)RawInput;
 
-  b32 ReachedEndOfBuffer = false;
   chunk_buffer Buffer = {};
-  Buffer.ReachedEndOfBuffer = false;
-  Buffer.Memory = Input->FileMemory;
-  Buffer.Size   = Input->MemorySize;
+  Buffer.ChunkMemory = Input->ChunkMemory;
+  Buffer.ChunkSize   = Input->ChunkSize;
+  Buffer.ChunkOffset = 0;
+
+  Buffer.FileHandle = CreateFileA(Input->Path, GENERIC_READ, FILE_SHARE_READ, 0,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+  Assert(Buffer.FileHandle != INVALID_HANDLE_VALUE);
+  Buffer.FileOffset  = Input->FileOffset;
+
+  struct __stat64 Stat;
+  _stat64(Input->Path, &Stat);
+  Buffer.FileSize    = Stat.st_size;
+
+  DWORD BytesRead = 0;
+  SetFilePointerEx(Buffer.FileHandle, *(LARGE_INTEGER*)&Buffer.FileOffset, 0, FILE_BEGIN);
+  Assert(ReadFile(Buffer.FileHandle, Buffer.ChunkMemory, Buffer.ChunkSize, &BytesRead, 0));
+  Buffer.FileOffset += BytesRead;
+
+  Buffer.BytesToProcess = Input->BytesToProcess;
+  Buffer.BytesProcessed = 0;
+
+  // ToDo read the first chunk
+
   if(Input->ThreadIndex != 0)
   {
     while(Current(&Buffer) != '\n')
@@ -422,7 +472,7 @@ THREAD_ENTRYPOINT(ParseChunks)
   u32 ParsedCount = 0;
   u8 * Strings = Input->StringMemory;
   u64 Allocated = 0;
-  while(!Buffer.ReachedEndOfBuffer)
+  while(Buffer.BytesProcessed < Buffer.BytesToProcess)
   {
     // Parse name
     u64 Key = 2166136261u;
@@ -430,6 +480,11 @@ THREAD_ENTRYPOINT(ParseChunks)
     while(Current(&Buffer) != ';')
     {
       u8 C = Current(&Buffer);
+      u8 D = C - '0';
+      if(D <= 9)
+      {
+        int a = 5;
+      }
       Key ^= C;
       *Strings++ = C;
       Key *= 16777619;
@@ -448,18 +503,17 @@ THREAD_ENTRYPOINT(ParseChunks)
     }
     s32 Number = 0;
     
-    #if 0
+    #if 1
     while(Current(&Buffer) != '\r')
     {
       u8 Digit = Current(&Buffer) - '0';
       AdvanceBuffer(&Buffer, false);
-      Number *= 10;
       if(Digit <= 9)
       {
+        Number *= 10;
         Number += Digit;
       }
     }
-    Assert(Result == Number);
     Number = Sign ? -Number : Number;
     #else
 
@@ -555,35 +609,17 @@ main(int ArgCount, char** Args)
     struct __stat64 Stat;
     _stat64(Args[1], &Stat);
 
-    u64 FileSize = Stat.st_size;
-    u8 * FileMemory = 0;
-    {
-      TimeBlock("Read");
-      HANDLE File = CreateFileA(Args[1], GENERIC_READ, FILE_SHARE_READ, 0,
-                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
-      #if 0
-      FileMemory = (u8*)Allocate(FileSize);
-      LONGLONG Offset = 0;
-      DWORD BytesRead;
-      while(Offset < FileSize)
-      {
-        SetFilePointerEx(File, (LARGE_INTEGER)Offset, 0, FILE_BEGIN);
-        ReadFile(File, FileMemory + Offset, min(1ULL << 30, FileSize - Offset), &BytesRead, 0);
-        Offset += BytesRead;
-      }
-      #else
-      HANDLE Mapping = CreateFileMappingA(File, 0, PAGE_READONLY, 0, 0, 0);
-      FileMemory = (u8*)MapViewOfFile(Mapping, FILE_MAP_READ, 0, 0, 0);
-      #endif
-    }
-
-    u64 MemoryPerThread = FileSize / MAX_THREAD_COUNT;
+    u64 BytesToProcessPerThread     = Stat.st_size / MAX_THREAD_COUNT;
     GlobalStringTable       = AllocateStruct(1024 * 16, string_entry);
+
+    u64 ChunkSize = Megabyte(8);
+    // ToDo, add some alignment here so we can use the SIMD thing!
+    u8* ChunkMemory = AllocateStruct(ChunkSize * MAX_THREAD_COUNT, u8);
 
     parse_chunks_input ParseInputs[MAX_THREAD_COUNT] = {};
     weather_entry * SortedEntries[MAX_THREAD_COUNT] = {};
     {
-      TimeBlock("Parsing");
+      TimeBlock("Setup");
 
       for(u64 ParseThreadIndex = 0;
           ParseThreadIndex < MAX_THREAD_COUNT;
@@ -593,20 +629,27 @@ main(int ArgCount, char** Args)
 
         ParseInput->Table       = AllocateStruct(1024 * 16 + 10000, weather_entry);
         ParseInput->Entries = ParseInput->Table + 1024 * 16;
-        ParseInput->StringMemory = (u8*)Allocate(Megabyte(100));
         SortedEntries[ParseThreadIndex] = ParseInput->Entries;
+        ParseInput->StringMemory = (u8*)Allocate(Megabyte(100));
+
+
+        ParseInput->FileOffset = ParseThreadIndex * BytesToProcessPerThread;
+        ParseInput->Path = Args[1]; 
         ParseInput->ThreadIndex = (u32)ParseThreadIndex;
-        ParseInput->FileMemory  = FileMemory + (ParseThreadIndex * MemoryPerThread);
-        ParseInput->MemorySize  = MemoryPerThread;
+        ParseInput->ChunkMemory = ChunkMemory + (ParseThreadIndex * ChunkSize);
+        ParseInput->ChunkSize   = ChunkSize;
+        ParseInput->BytesToProcess = BytesToProcessPerThread;
+
         if(ParseThreadIndex == MAX_THREAD_COUNT - 1)
         {
-          ParseInput->MemorySize += FileSize % MAX_THREAD_COUNT;
+          ParseInput->BytesToProcess += Stat.st_size % MAX_THREAD_COUNT;
         }
 
         ThreadHandles[ParseThreadIndex] = CreateThread(0, 0, ParseChunks, ParseInput, 0, 0);
       }
 
     }
+
     for(u32 ParseThreadIndex = 0;
         ParseThreadIndex < MAX_THREAD_COUNT;
         ParseThreadIndex++)
@@ -636,7 +679,6 @@ main(int ArgCount, char** Args)
       u32 BufferIndices[MAX_THREAD_COUNT] = {};
 
       u8 * Memory = (u8*)Allocate(Megabyte(2));
-
       u32 Offset = 0;
       u8 * Start = Memory;
       for(u32 StringIndex = 0;
@@ -669,14 +711,14 @@ main(int ArgCount, char** Args)
         f32 Minimum = FinalWeatherEntry.Min / 10.0f;
         f32 Maximum = FinalWeatherEntry.Max / 10.0f;
 
-        u32 Written = sprintf((char*)Memory, "%s=%.1f/%.1f/%.1f, ", StringEntry->Name, Minimum,
-                          Mean, Maximum);
+        u32 Written = sprintf((char*)Memory, "%s=%.1f/%.1f/%.1f/%d, ", StringEntry->Name, Minimum,
+                          Mean, Maximum, FinalWeatherEntry.Count);
         Offset += Written;
         Memory += Written;
       }
 
         #if 1
-      printf("{%.*s}\n", Offset, Start);
+      printf("{%s}\n", Start);
 #else
       FILE * File;
       fopen_s(&File, "out.txt", "w");
