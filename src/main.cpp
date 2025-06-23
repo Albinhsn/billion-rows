@@ -457,7 +457,6 @@ THREAD_ENTRYPOINT(ParseChunks)
   Buffer.BytesToProcess = Input->BytesToProcess;
   Buffer.BytesProcessed = 0;
 
-  // ToDo read the first chunk
 
   if(Input->ThreadIndex != 0)
   {
@@ -480,11 +479,6 @@ THREAD_ENTRYPOINT(ParseChunks)
     while(Current(&Buffer) != ';')
     {
       u8 C = Current(&Buffer);
-      u8 D = C - '0';
-      if(D <= 9)
-      {
-        int a = 5;
-      }
       Key ^= C;
       *Strings++ = C;
       Key *= 16777619;
@@ -496,25 +490,34 @@ THREAD_ENTRYPOINT(ParseChunks)
 
     AdvanceBuffer(&Buffer, false);
 
-    b32 Sign = Current(&Buffer) == '-';
-    if(Sign)
+    s32 Sign = 1;
+    if(Current(&Buffer) == '-')
     {
       AdvanceBuffer(&Buffer, false);
+      Sign = -1;
     }
+
     s32 Number = 0;
-    
     #if 1
-    while(Current(&Buffer) != '\r')
+    u32 D0 = Current(&Buffer) - '0';
+    AdvanceBuffer(&Buffer, false);
+    u32 D1 = Current(&Buffer) - '0';
+    AdvanceBuffer(&Buffer, false);
+    if(D1 <= 9)
     {
-      u8 Digit = Current(&Buffer) - '0';
       AdvanceBuffer(&Buffer, false);
-      if(Digit <= 9)
-      {
-        Number *= 10;
-        Number += Digit;
-      }
+      D0 *= 100;
+      D1 *= 10;
     }
-    Number = Sign ? -Number : Number;
+    else
+    {
+      D0 *= 10;
+      D1 = 0;
+    }
+    u8 F1 = Current(&Buffer) - '0';
+    AdvanceBuffer(&Buffer, false);
+    Number = D1 + D0 + F1;
+    Number = Sign * Number;
     #else
 
     __m128i D = _mm_loadu_si128((__m128i*)(Buffer.Memory + Buffer.Offset));
@@ -551,7 +554,6 @@ THREAD_ENTRYPOINT(ParseChunks)
     Result = Sign ? -Result : Result;
     Number = Result;
     #endif
-    
 
     AdvanceBuffer(&Buffer, false);
     AdvanceBuffer(&Buffer, false);
@@ -612,7 +614,7 @@ main(int ArgCount, char** Args)
     u64 BytesToProcessPerThread     = Stat.st_size / MAX_THREAD_COUNT;
     GlobalStringTable       = AllocateStruct(1024 * 16, string_entry);
 
-    u64 ChunkSize = Megabyte(8);
+    u64 ChunkSize = Megabyte(1);
     // ToDo, add some alignment here so we can use the SIMD thing!
     u8* ChunkMemory = AllocateStruct(ChunkSize * MAX_THREAD_COUNT, u8);
 
